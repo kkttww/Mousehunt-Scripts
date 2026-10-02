@@ -14,7 +14,7 @@ Tampermonkey userscripts for [MouseHunt](https://www.mousehuntgame.com).
 2. Install each script from Greasy Fork (gets automatic updates):
    - [Auto Disarm/Swap Bait](https://greasyfork.org/en/scripts/467434)
    - [Auto Horn & KR Solver](https://greasyfork.org/en/scripts/598373-mousehunt-auto-horn-kr-solver-kane)
-   - Cerulean Skyport Autopilot: link coming soon
+   - [Cerulean Skyport Autopilot](https://greasyfork.org/en/scripts/598379-mousehunt-cerulean-skyport-autopilot-kane)
 
 The scripts work on their own and also together: Auto Horn and Auto Disarm/Swap Bait wait while the Skyport Autopilot is in the middle of an action.
 
