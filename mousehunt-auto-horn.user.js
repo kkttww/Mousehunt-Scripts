@@ -1734,7 +1734,7 @@
     const { data } = await worker.recognize(captchaCanvas(img));
     const code = (data.text || '').replace(/[^A-Za-z0-9]/g, '');
     if (code.length !== KR_CODE_LENGTH) {
-      log(`OCR read "${code}" — not ${KR_CODE_LENGTH} characters, asking for a new code`);
+      log(`OCR read "${code}", not ${KR_CODE_LENGTH} characters, asking for a new code`);
       await requestNewCode();
       return false;
     }
@@ -1793,7 +1793,7 @@
         return;
       }
       st.krGaveUp = true;
-      log(`King's Reward still not solved after a reload — waiting for you`);
+      log(`King's Reward still not solved after a reload, waiting for you`);
     } finally {
       await releaseOcrWorker();
       st.krBusy = false;
@@ -1808,7 +1808,7 @@
       st.lastProgress = now;
       if (st.krGaveUp) {
         setStatus('err', "King's Reward needs you", 'solve it and the script carries on');
-        document.title = `⚠ KR — ${baseTitle}`;
+        document.title = `⚠ KR: ${baseTitle}`;
       } else if (!st.krBusy) {
         await solveKR();
       }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MouseHunt Cerulean Skyport Autopilot (Kane)
 // @namespace    https://greasyfork.org/en/users/979741
-// @version      1.0.0
+// @version      1.0.1
 // @description  Runs Cerulean Skyport for you: launches airship shipments, swaps bait, crafts Sky Pirate Swiss and Aurora Bocconcini, and starts raids with the luckiest weapon and luck charms. Starts paused so you can check its plan first. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
 // @author       Kane
 // @license      MIT
@@ -35,15 +35,15 @@
   const PANEL_ID = 'mhcs-panel';
 
   const MIN_SWISS = 30;              // pre-flight Sky Pirate Swiss requirement
-  const MIN_BOCCONCINI = 20;         // Bocconcini mode threshold
   const INTEL_CAP = 50;              // skip any shipment whose location's raid intel is already >= this (raid cost)
   const COOLDOWN_MS = 4000;          // debounce between actions
   const HEARTBEAT_MS = 6000;         // periodic re-evaluation
   const FAIL_BACKOFF_MS = 60000;     // pause an action type after it fails
   const CRAFT_STALE_MS = 5 * 60000;  // don't re-craft while inventory looks unchanged
   const RAID_MIN_BOCCONCINI = 25;    // only start a raid with at least this much Bocconcini (raid = 25 hunts)
-  const CHARM_MIN_QTY = 500;         // only luck charms held in quantities above this are used
-  const BOCC_SPICE_PER_CRAFT = 8;    // Bocconcini recipe: 8 Aurora Spice + 1 Magic Essence -> 2 cheese
+  const CHARM_MIN_QTY = 300;         // default for cfg.charmMinQty
+  const BOCC_SPICE_PER_CRAFT = 8;    // Bocconcini: 8 Spice + 1 Essence -> 2, or 8 Spice + 5,000 Gold -> 1
+  const BOCC_GOLD_PER_CRAFT = 5000;
   const FALLBACK_LUCK = 100;         // luck target when minluck can't be worked out
 
   // Mouse power and effectiveness (% per power type, POWER_TYPES order) for Cerulean Skyport and its raid
@@ -180,6 +180,8 @@
     gouda: 'gouda_cheese',
     superbrie: 'super_brie_cheese',
     bocconcini: 'aurora_bocconcini_cheese',
+    romano: 'sky_raider_romano_cheese',
+    cannonball: 'raidbuster_cannonball_stat_item',
   };
 
   const IMG = 'https://www.mousehuntgame.com/images/items/';
@@ -189,10 +191,12 @@
       ['gas', 'Gas', 'stats/large/fda69ba755cf84f99cd5136791377d88.png'],
       ['cloudstone', 'Cloudstone', 'stats/large/2bbc32752360ae74758c04fa0a618dc0.png'],
       ['ingot', 'Ingot', 'stats/large/4e676496af3a55f7da207a1f6a52d633.png'],
+      ['cannonball', 'Cannonball', 'stats/830132ee1e485b530d50f2632191ecb8.gif'],
     ]],
     ['Cheese', [
       ['swiss', 'Swiss', 'bait/980f6d461473de11fb9595555417a896.jpg'],
       ['bocconcini', 'Bocconcini', 'bait/000c8867d69ba7e2ee0fc781b6945615.jpg'],
+      ['romano', 'Romano', 'bait/f1721874903c83aebf073f65419c782a.gif'],
       ['gouda', 'Gouda', 'bait/e27d9a7cae531047358a6eccbd729406.jpg'],
       ['superbrie', 'SUPER|brie+', 'bait/ec38729241e103fe744a9ed03409fbd6.jpg'],
     ]],
@@ -206,6 +210,7 @@
   const BAITS = {
     swiss: { type: 'sky_pirate_cheese', label: 'Sky Pirate Swiss', re: /sky\s*pirate\s*swiss/i },
     bocconcini: { type: 'aurora_bocconcini_cheese', label: 'Aurora Bocconcini', re: /bocconcini/i },
+    romano: { type: 'sky_raider_romano_cheese', label: 'Sky Raider Romano', re: /romano/i },
     gouda: { type: 'gouda_cheese', label: 'Gouda', re: /^gouda/i },
     superbrie: { type: 'super_brie_cheese', label: 'SUPER|brie+', re: /^super\|brie\+/i },
   };
@@ -226,6 +231,7 @@
     hudCraftButton: 'button.headsUpDisplayCeruleanSkyportView__baitBuyButton[data-recipe="sky_pirate_recipe"]',
     hudBoccCraftButton: 'button.headsUpDisplayCeruleanSkyportView__baitBuyButton[data-recipe="aurora_bocconcini_recipe"]',
     hudRaidButton: 'button.headsUpDisplayCeruleanSkyportView__startRaidButton',
+    hudFuelToggle: '.headsUpDisplayCeruleanSkyportView__fuelToggleButton',
     raidView: '.ceruleanSkyportRaidView',
     raidHuntsRemaining: '.ceruleanSkyportRaidView__raidHuntsRemaining',
     hudDialog: '.headsUpDisplayCeruleanSkyportView__dialogContainer.active',
@@ -263,14 +269,19 @@
     autoLaunch: true,
     autoBait: true,
     autoCraft: true,
-    spiceMode: 'swiss',       // 'swiss' | 'bocconcini'
+    spiceMode: 'swiss',       // 'swiss' | 'romano' | 'bocconcini'
     dockedAction: 'gouda',    // 'gouda' | 'superbrie' | 'disarm' | 'none'
     minDebris: 60,
     minGas: 90,
     minCloudstone: 120,
     autoRaid: true,           // start raids when intel >= 50 and Bocconcini >= 25
+    craftEssence: true,       // craft with Magic Essence (Gold as fallback); off = Gold recipes only
+    luckCharmsRaid: true,     // pick luck charms during raids
     luckCharmsNormal: false,  // also pick luck charms during normal shipments
-    dryRun: true,            // log decisions without acting (untick in the panel to go live)
+    charmMinQty: CHARM_MIN_QTY, // only luck charms held in quantities above this are used
+    cannonRaid: 'off',        // RaidBuster Cannonballs on raids: 'off' | 'always' | 'enough' (only with enough for the rest of the raid)
+    cannonShip: false,        // RaidBuster Cannonballs during shipments
+    dryRun: true,            // Pause: log decisions without acting (click the Pause button to go live)
     minimized: false,
     showSettings: false,      // panel sections folded until opened
     showResources: false,
@@ -308,6 +319,7 @@
   /* ------------------------------------------------------------------ *
    * Helpers
    * ------------------------------------------------------------------ */
+  const LOG_MAX = 20;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const $1 = (sel, root) => (root || document).querySelector(sel);
 
@@ -349,7 +361,7 @@
   function log(msg, level) {
     const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     rt.log.unshift(`${t}  ${msg}`);
-    if (rt.log.length > 8) rt.log.length = 8;
+    if (rt.log.length > LOG_MAX) rt.log.length = LOG_MAX;
     (level === 'error' ? console.warn : console.log)(`[${SCRIPT}] ${msg}`);
     updateUI();
   }
@@ -463,6 +475,10 @@
       gouda: qty(ITEMS.gouda),
       superbrie: qty(ITEMS.superbrie),
       bocconcini: qty(ITEMS.bocconcini),
+      romano: qty(ITEMS.romano),
+      cannonball: qty(ITEMS.cannonball),
+      fuelOn: !!q.is_fuel_enabled,
+      canFuel: q.can_enable_fuel !== false,
       gold: toNum(u.gold),
       bait,
       baitKey: baitKeyOf(bait),
@@ -476,9 +492,8 @@
    * Strategy
    * ------------------------------------------------------------------ */
   function flightBaitFor(shipType, s) {
-    if (shipType === 'spice_shipment' && cfg.spiceMode === 'bocconcini' && s.bocconcini >= MIN_BOCCONCINI) {
-      return 'bocconcini';
-    }
+    // Romano or Bocconcini on every shipment while you have any; Swiss otherwise.
+    if ((cfg.spiceMode === 'romano' || cfg.spiceMode === 'bocconcini') && s[cfg.spiceMode] > 0) return cfg.spiceMode;
     return 'swiss';
   }
 
@@ -512,20 +527,23 @@
     const need = Math.max(0, target - s.swiss);
     if (need <= 0) return null;
     const curdBatches = Math.floor(s.curd / 20);
-    const r2 = Math.min(curdBatches, Math.floor(s.essence));
+    const r2 = cfg.craftEssence ? Math.min(curdBatches, Math.floor(s.essence)) : 0;
     if (r2 > 0) return { recipe: 2, times: Math.min(r2, Math.ceil(need / 2)) };
     const r1 = Math.min(curdBatches, Math.floor(s.gold / 2000));
     if (r1 > 0) return { recipe: 1, times: Math.min(r1, need) };
     return null;
   }
 
-  // Bocconcini (essence recipe only): 8 Spice + 1 Essence -> 2 cheese.
+  // Bocconcini. Recipe 2: 8 Spice + 1 Essence -> 2 cheese. Recipe 1: 8 Spice + 5,000 Gold -> 1 cheese.
   function boccCraftPlan(s, target) {
     const need = Math.max(0, target - s.bocconcini);
     if (need <= 0) return null;
-    const times = Math.ceil(need / 2);
-    if (s.spice < times * BOCC_SPICE_PER_CRAFT || s.essence < times) return null;
-    return { recipe: 2, times };
+    const spiceBatches = Math.floor(s.spice / BOCC_SPICE_PER_CRAFT);
+    const r2 = cfg.craftEssence ? Math.min(spiceBatches, Math.floor(s.essence)) : 0;
+    if (r2 > 0) return { recipe: 2, times: Math.min(r2, Math.ceil(need / 2)) };
+    const r1 = Math.min(spiceBatches, Math.floor(s.gold / BOCC_GOLD_PER_CRAFT));
+    if (r1 > 0) return { recipe: 1, times: Math.min(r1, need) };
+    return null;
   }
 
   function pickRaid(s) {
@@ -534,10 +552,12 @@
       .sort((a, b) => b.intel - a.intel)[0] || null;
   }
 
-  // Charm rule: among luck charms held above CHARM_MIN_QTY, use the lowest luck tier that still covers
-  // `need` (most plentiful within the tier); if none covers it, the highest tier (most plentiful).
+  const charmMin = () => Math.max(0, toNum(cfg.charmMinQty));
+
+  // Charm rule: among luck charms held above the Min charms setting, use the lowest luck tier that still
+  // covers `need` (most plentiful within the tier); if none covers it, the highest tier (most plentiful).
   function chooseCharm(charms, need) {
-    const pool = charms.filter((c) => c.qty > CHARM_MIN_QTY && c.luck > 0);
+    const pool = charms.filter((c) => c.qty > charmMin() && c.luck > 0);
     if (!pool.length) return null;
     const enough = pool.filter((c) => c.luck >= need);
     const tierLuck = enough.length ? Math.min(...enough.map((c) => c.luck)) : Math.max(...pool.map((c) => c.luck));
@@ -558,34 +578,61 @@
     const c = CRAFTS[which];
     const last = rt.lastCraft;
     if (last && last.which === which && Date.now() - last.at < CRAFT_STALE_MS && s[which] <= last.before) {
-      return { status: 'Crafted — waiting for inventory refresh (reload if stuck)' };
+      return { status: 'Crafted, waiting for inventory refresh (reload if stuck)' };
     }
     if (backedOff('craft')) return { status: 'Craft retry backing off' };
     const plan = which === 'swiss' ? craftPlan(s, target) : boccCraftPlan(s, target);
     if (!plan) {
       return { status: which === 'swiss'
-        ? `Need ${target} Swiss — not enough Curd + Essence/Gold`
-        : `Need ${target} Bocconcini — not enough Spice (${BOCC_SPICE_PER_CRAFT}/craft) + Essence` };
+        ? `Need ${target} Swiss, not enough Curd + ${cfg.craftEssence ? 'Essence/Gold' : 'Gold'}`
+        : `Need ${target} Bocconcini, not enough Spice + ${cfg.craftEssence ? 'Essence/Gold' : 'Gold'}` };
     }
-    if (!$1(c.button)) return { status: `Need ${c.label} — open Camp to auto-craft` };
-    const label = `Craft ${c.label} (Recipe ${plan.recipe} ×${plan.times})`;
+    if (!$1(c.button)) return { status: `Need ${c.label}, open Camp to auto-craft` };
+    const label = `Craft ${plan.times * (plan.recipe === 2 ? 2 : 1)} ${c.label} (${plan.recipe === 2 ? 'Essence' : 'Gold'})`;
     return { status: label, kind: 'craft', label, run: () => craftCheese(c, plan, s[which]) };
   }
 
+  // RaidBuster Cannonballs ("fuel"): the HUD toggle switches them on/off. Only managed when one of the
+  // cannonball settings is on; otherwise the player's own choice is left alone.
+  // Returns true/false, or null when that setting is off (leave the switch as the player set it).
+  function fuelWanted(s) {
+    if (s.isIntercepting) {
+      if (cfg.cannonRaid === 'always') return s.cannonball > 0;
+      if (cfg.cannonRaid === 'enough') return s.cannonball >= Math.max(1, s.raid.hunts);
+      return null;
+    }
+    if (s.inFlight) return cfg.cannonShip ? s.cannonball > 0 : null;
+    return null;
+  }
+
+  function fuelDecision(s) {
+    const want = fuelWanted(s);
+    if (want === null || want === s.fuelOn) return null;
+    if (want && !s.canFuel) return null;
+    if (backedOff('fuel') || !$1(SEL.hudFuelToggle)) return null;
+    const label = `Turn RaidBuster Cannonballs ${want ? 'on' : 'off'}`;
+    return { status: label, kind: 'fuel', label, run: () => setFuel(want) };
+  }
+
   function decide(s) {
-    if (s.isIntercepting) return raidDecision(s);
+    const fuel = fuelDecision(s);
+    if (s.isIntercepting) {
+      const r = raidDecision(s);
+      return r.run || !fuel ? r : fuel;   // weapon / charm / bait setup first, then cannonballs
+    }
+    if (fuel) return fuel;
     if (raidStore.active) {
-      if (backedOff('raid')) return { status: 'Raid over — trap restore backing off' };
-      return { status: 'Raid over — restoring trap', kind: 'raid', label: 'Restore pre-raid trap', run: () => restoreAfterRaid() };
+      if (backedOff('raid')) return { status: 'Raid over, trap restore backing off' };
+      return { status: 'Raid over, restoring trap', kind: 'raid', label: 'Restore trap', done: '', run: () => restoreAfterRaid() };
     }
 
     if (s.inFlight) {
-      const head = `In flight: ${s.shipName || 'shipment'} — ${s.hunts} hunts left`;
+      const head = `In flight: ${s.shipName || 'shipment'}, ${s.hunts} hunts left`;
       if (!cfg.autoBait) return { status: `${head} (bait swap off)` };
       const want = flightBaitFor(s.shipType, s);
       if (s.baitKey === want) {
         if (cfg.luckCharmsNormal && rt.normalLuckKey !== flightLuckKey(s) && !backedOff('luck')) {
-          return { status: `${head} — checking luck`, kind: 'luck', label: 'Luck check (shipment)', run: () => normalLuckStep(s) };
+          return { status: `${head}, checking luck`, kind: 'luck', label: 'Luck check (shipment)', run: () => normalLuckStep(s) };
         }
         return { status: `${head}, ${BAITS[want].label} armed${rt.luckNote ? ` · ${rt.luckNote}` : ''}` };
       }
@@ -593,11 +640,11 @@
         if (want === 'swiss' && cfg.autoCraft) {
           const c = craftDecision(s);
           if (c.run) return c;
-          return { status: `${head} — out of Swiss. ${c.status}` };
+          return { status: `${head}, out of Swiss. ${c.status}` };
         }
-        return { status: `${head} — out of ${BAITS[want].label}` };
+        return { status: `${head}, out of ${BAITS[want].label}` };
       }
-      if (backedOff('bait')) return { status: `${head} — bait swap backing off` };
+      if (backedOff('bait')) return { status: `${head}, bait swap backing off` };
       const label = `Arm ${BAITS[want].label}`;
       return { status: label, kind: 'bait', label, run: () => armBait(want) };
     }
@@ -612,12 +659,12 @@
           if (c.run) return c;
           note = `${raid.name} raid ready, need ${RAID_MIN_BOCCONCINI} Bocconcini (${c.status})`;
         } else if (!$1(SEL.hudRaidButton) && !$1(SEL.raidDialog)) {
-          note = `${raid.name} raid ready — open Camp to start`;
+          note = `${raid.name} raid ready, open Camp to start`;
         } else if (backedOff('raidStart')) {
           note = 'Raid start retry backing off';
         } else {
-          const label = `Start ${raid.name} raid (${raid.intel} intel)`;
-          return { status: label, kind: 'raidStart', label, run: () => startRaid(raid) };
+          const label = `Start ${raid.name} raid`;
+          return { status: label, kind: 'raidStart', label, done: '', run: () => startRaid(raid) };
         }
       }
     }
@@ -626,10 +673,10 @@
       if (skipped) note = note ? `${note} · ${skipped}` : skipped;
       if (!sh) {
         note = allCapped
-          ? `${skipped} — every affordable route is full; start a raid or wait for rotation`
+          ? `${skipped}, every affordable route is full; start a raid or wait for rotation`
           : 'No shipment affordable above reserves';
       } else if (!$1(SEL.hudShipButton(sh.type)) && !$1(SEL.shipDialog)) {
-        note = `Ready for ${sh.label} — open Camp to launch`;
+        note = `Ready for ${sh.label}, open Camp to launch`;
       } else {
         const cheese = flightBaitFor(sh.type, s);
         if (cheese === 'swiss' && s.swiss < MIN_SWISS) {
@@ -643,8 +690,8 @@
         } else if (backedOff('launch')) {
           note = 'Launch retry backing off';
         } else {
-          const label = `Launch ${sh.label} with ${BAITS[cheese].label}${skipped ? ` (${skipped})` : ''}`;
-          return { status: label, kind: 'launch', label, run: () => launchShipment(sh, cheese) };
+          const label = `Launch ${SHIP_SHORT[sh.type]} Shipment (${BAITS[cheese].label})`;
+          return { status: label, kind: 'launch', label, done: '', run: () => launchShipment(sh, cheese) };
         }
       }
     }
@@ -654,22 +701,22 @@
   function dockedBaitDecision(s, note) {
     let pre = note ? `${note} · ` : '';
     if (!cfg.autoBait || cfg.dockedAction === 'none') return { status: `${pre}Docked` };
-    if (backedOff('bait')) return { status: `${pre}Docked — bait swap backing off` };
+    if (backedOff('bait')) return { status: `${pre}Docked, bait swap backing off` };
     if (cfg.dockedAction === 'gouda' || cfg.dockedAction === 'superbrie') {
       // Only the selected cheese; no switching to the other one when it runs out.
       const want = cfg.dockedAction;
-      if (s.baitKey === want) return { status: `${pre}Docked — ${BAITS[want].label} armed` };
+      if (s.baitKey === want) return { status: `${pre}Docked, ${BAITS[want].label} armed` };
       if (s[want] > 0) {
         const label = `Arm ${BAITS[want].label}`;
         return { status: label, kind: 'bait', label: `${label} (docked)`, run: () => armBait(want) };
       }
       pre += `out of ${BAITS[want].label} · `;
     }
-    const premium = s.baitKey === 'swiss' || s.baitKey === 'bocconcini';
+    const premium = s.baitKey === 'swiss' || s.baitKey === 'bocconcini' || s.baitKey === 'romano';
     if (s.bait.armed && (cfg.dockedAction === 'disarm' || premium)) {
       return { status: 'Disarm bait', kind: 'bait', label: 'Disarm bait (docked)', run: () => disarmBait() };
     }
-    return { status: `${pre}Docked — ${s.bait.armed ? 'bait idle' : 'disarmed'}` };
+    return { status: `${pre}Docked, ${s.bait.armed ? 'bait idle' : 'disarmed'}` };
   }
 
   /* ------------------------------------------------------------------ *
@@ -690,6 +737,15 @@
         () => { clearTimeout(timer); reject(new Error('TrapControl request failed')); }
       );
     });
+  }
+
+  async function setFuel(on) {
+    const btn = $1(SEL.hudFuelToggle);
+    if (!btn) throw new Error('cannonball toggle not found');
+    btn.click();
+    if (!(await waitFor(() => { const q = getQuest(); return !!(q && q.is_fuel_enabled) === on; }, 8000))) {
+      throw new Error(`cannonballs did not turn ${on ? 'on' : 'off'}`);
+    }
   }
 
   async function armBait(key) {
@@ -865,36 +921,36 @@
     const src = source === 'fallback' ? ` [target ${FALLBACK_LUCK}, minluck unknown]` : source === 'tool' ? ' [Minluck tool]' : '';
     if (need <= 0) {
       if (cur.charm && cur.charm.luck > 0) await disarmCharm();
-      return `luck ${luckNoCharm}/${minluck} — no charm needed${src}`;
+      return `luck ${luckNoCharm}/${minluck}, no charm needed${src}`;
     }
     const pick = chooseCharm(gear.charms, need);
-    if (!pick) return `luck ${luckNoCharm}/${minluck} — no luck charm above ${CHARM_MIN_QTY}${src}`;
+    if (!pick) return `luck ${luckNoCharm}/${minluck}, no luck charm above ${charmMin()}${src}`;
     if (!cur.charm || cur.charm.name !== pick.charm.name) await armGear(pick.charm.type, 'trinket', pick.charm.name);
     return `${pick.charm.name} +${pick.charm.luck} → luck ${luckNoCharm + pick.charm.luck}/${minluck}${pick.enough ? '' : ' (not guaranteed)'}${src}`;
   }
 
   function raidDecision(s) {
     const r = s.raid;
-    const head = `Raid: ${r.name} — ${r.hunts} hunts left`;
+    const head = `Raid: ${r.name}, ${r.hunts} hunts left`;
     const a = raidStore.active;
     if (!a || a.name !== r.name) {
-      return { status: `${head} — setting up`, kind: 'raid', label: `Raid setup (${r.name})`, run: () => raidStep(s) };
+      return { status: `${head}, setting up`, kind: 'raid', label: `Raid setup (${r.name})`, run: () => raidStep(s) };
     }
     if (cfg.autoBait && s.baitKey !== 'bocconcini') {
-      if (s.bocconcini > 0) return { status: `${head} — arming Bocconcini`, kind: 'bait', label: 'Arm Aurora Bocconcini (raid)', run: () => armBait('bocconcini') };
+      if (s.bocconcini > 0) return { status: `${head}, arming Bocconcini`, kind: 'bait', label: 'Arm Aurora Bocconcini (raid)', run: () => armBait('bocconcini') };
       if (cfg.autoCraft) {
         const c = craftDecision(s, 'bocconcini', Math.max(2, r.hunts));
         if (c.run) return c;
-        return { status: `${head} — out of Bocconcini. ${c.status}` };
+        return { status: `${head}, out of Bocconcini. ${c.status}` };
       }
-      return { status: `${head} — out of Bocconcini` };
+      return { status: `${head}, out of Bocconcini` };
     }
     const u = window.user || {};
     const charmGone = a.charmName && u.trinket_name !== a.charmName;
     const weaponChanged = a.weaponName && u.weapon_name !== a.weaponName;
     if ((a.phase !== 'done' || charmGone || weaponChanged) && !backedOff('raid')) {
       if (a.phase === 'done' && (charmGone || weaponChanged)) { a.phase = 'charm'; saveRaidStore(); }
-      return { status: `${head} — ${a.phase === 'weapon' ? 'choosing weapon' : 'choosing charm'}`, kind: 'raid', label: `Raid ${a.phase} (${r.name})`, run: () => raidStep(s) };
+      return { status: `${head}, ${a.phase === 'weapon' ? 'choosing weapon' : 'choosing charm'}`, kind: 'raid', label: `Raid ${a.phase} (${r.name})`, run: () => raidStep(s) };
     }
     return { status: `${head}${a.note ? ` · ${a.note}` : ''}` };
   }
@@ -916,7 +972,6 @@
       };
       raidStore.pending = null;
       saveRaidStore();
-      log(`Raid ${r.name}: allowed ${r.powerTypes.join('/') || '?'}`);
       return;
     }
 
@@ -927,7 +982,7 @@
       const best = allowed.map((pt) => gear.weapons.filter((w) => w.powerType === pt).sort((x, y) => y.luck - x.luck || y.power - x.power)[0])
         .filter(Boolean).sort((x, y) => y.luck - x.luck);
       if (!best.length) throw new Error(`no weapon of type ${allowed.join('/')}`);
-      const topCharm = Math.max(0, ...gear.charms.filter((c) => c.qty > CHARM_MIN_QTY).map((c) => c.luck));
+      const topCharm = cfg.luckCharmsRaid ? Math.max(0, ...gear.charms.filter((c) => c.qty > charmMin()).map((c) => c.luck)) : 0;
       const cur = armedGear(gear);
       const baseLuck = cur.luck - (cur.weapon ? cur.weapon.luck : 0) - (cur.charm ? cur.charm.luck : 0);
 
@@ -949,7 +1004,6 @@
             ml = await readMinluck();
             raidStore.minluck[key] = ml === Infinity ? 'inf' : ml;
             saveRaidStore();
-            log(`Minluck ${r.name} with ${w.powerType}: ${ml}`);
           }
           if (ml === 'inf') ml = Infinity;
         } else {
@@ -962,17 +1016,25 @@
         a.minluck = table ? table[chosen.powerType] : toolOk ? raidStore.minluck[`${r.name}|${chosen.powerType}`] : FALLBACK_LUCK;
         if (a.minluck === 'inf') a.minluck = Infinity;
       }
-      if (table) log(`Minluck ${r.name} (table): ${best.map((w) => `${w.powerType} ${table[w.powerType]}`).join(', ')}`);
       if (u.weapon_name !== chosen.name) await armGear(chosen.type, 'weapon', chosen.name);
       a.weaponName = chosen.name;
       a.powerType = chosen.powerType;
       a.phase = 'charm';
       saveRaidStore();
-      log(`Raid weapon: ${chosen.name} (${chosen.powerType}, ${chosen.luck} luck)`);
+      log(`✔ Raid weapon: ${chosen.name}`);
       return;
     }
 
     if (a.phase === 'charm') {
+      if (!cfg.luckCharmsRaid) {
+        a.note = 'luck charms off for raids';
+        a.charmTouched = false;
+        a.charmName = null;
+        a.phase = 'done';
+        saveRaidStore();
+        return;
+      }
+      a.charmTouched = true;
       // Re-resolve for the armed weapon (charm changes don't alter minluck).
       const cur = await currentMinluck();
       const ml = cur.source === 'fallback' && a.minluck != null && a.source !== 'fallback' ? a.minluck : cur.value;
@@ -980,7 +1042,7 @@
       a.charmName = (window.user || {}).trinket_name || null;
       a.phase = 'done';
       saveRaidStore();
-      log(`Raid luck: ${a.note}`);
+      log(`✔ Raid luck: ${a.note}`);
     }
   }
 
@@ -991,10 +1053,11 @@
       await armGear(a.prevWeapon.type, 'weapon', a.prevWeapon.name);
       return;
     }
-    await disarmCharm();
+    const touched = !a || a.charmTouched !== false;   // leave your own charm alone if raids didn't use charms
+    if (touched) await disarmCharm();
     raidStore.active = null;
     saveRaidStore();
-    log('Raid finished — trap restored, charm removed');
+    log(`✔ Trap restored${touched ? ', charm removed' : ''}`);
   }
 
   function flightLuckKey(s) {
@@ -1007,7 +1070,7 @@
     const ml = await currentMinluck();
     rt.luckNote = await applyLuckCharm(ml.value, gear, ml.source);
     rt.normalLuckKey = flightLuckKey(s);
-    log(`Shipment luck: ${rt.luckNote}`);
+    log(`✔ Shipment luck: ${rt.luckNote}`);
   }
 
   async function startRaid(raid) {
@@ -1089,7 +1152,7 @@
     const done = await waitFor(() => !$1(SEL.hudDialog), 10000);
     if (!done) {
       closeHudDialog();
-      throw new Error('craft dialog did not close — craft may have failed');
+      throw new Error('craft dialog did not close, craft may have failed');
     }
   }
 
@@ -1113,8 +1176,8 @@
     // 2) Cheese (same e.target rule: click the bait container, not the image inside)
     let cheese = cheeseKey;
     let baitEl = $1(SEL.shipBait(BAITS[cheese].type), dlg);
-    if (!baitEl && cheese === 'bocconcini') {
-      log('Bocconcini not offered — using Sky Pirate Swiss', 'error');
+    if (!baitEl && cheese !== 'swiss') {
+      log(`${BAITS[cheese].label} not offered, using Sky Pirate Swiss`, 'error');
       cheese = 'swiss';
       baitEl = $1(SEL.shipBait(BAITS[cheese].type), dlg);
     }
@@ -1128,7 +1191,7 @@
     if (disarmCb) {
       if (disarmCb.checked) disarmCb.click();
     } else {
-      log('Post-trade toggle not found — leaving game default', 'error');
+      log('Post-trade toggle not found, leaving game default', 'error');
     }
     await sleep(300);
 
@@ -1152,14 +1215,15 @@
     rt.tickTimer = setTimeout(tick, Math.max(0, ms));
   }
 
-  async function runAction(kind, label, fn) {
+  async function runAction(kind, label, fn, done) {
     rt.busy = true;
     rt.lastAction = Date.now();
-    log(`▶ ${label}`);
     try {
       await fn();
       rt.backoff[kind] = 0;
-      log(`✔ ${label}`);
+      if (kind === 'launch') rt.launchedAt = Date.now();
+      if (kind === 'raidStart') rt.raidStartedAt = Date.now();
+      if (done !== '') log(done || `✔ ${label}`);   // '' = an event line covers it (launch, raid start)
     } catch (e) {
       rt.backoff[kind] = Date.now() + FAIL_BACKOFF_MS;
       log(`✖ ${label}: ${(e && e.message) || e}`, 'error');
@@ -1178,6 +1242,82 @@
   const SHIP_SHORT = { gas_shipment: 'Gas', cloudstone_shipment: 'Cloudstone', spice_shipment: 'Spice' };
   try { localStorage.removeItem('mhCeruleanSkyport.flights.v1'); } catch (e) { /* old intel-tracker data */ }
 
+  /* ------------------------------------------------------------------ *
+   * Event log: launches, returns (with gains), raids, problems on/off
+   * ------------------------------------------------------------------ */
+  const EVENTS_KEY = 'mhCeruleanSkyport.events.v1';
+  const LOOT = [['debris', 'Debris'], ['gas', 'Gas'], ['cloudstone', 'Cloudstone'], ['ingot', 'Ingot'], ['spice', 'Spice'], ['cannonball', 'Cannonballs']];
+  const events = (() => {
+    try { return Object.assign({ ship: null, raid: null, problems: {} }, JSON.parse(localStorage.getItem(EVENTS_KEY) || 'null')); }
+    catch (e) { return { ship: null, raid: null, problems: {} }; }
+  })();
+  const saveEvents = () => { try { localStorage.setItem(EVENTS_KEY, JSON.stringify(events)); } catch (e) { /* storage unavailable */ } };
+
+  function lootSnapshot(s) {
+    const items = (getQuest() || {}).items || {};
+    const snap = {};
+    for (const [k] of LOOT) snap[k] = s[k];
+    for (const k of Object.keys(items)) if (/_intel_stat_item$/.test(k)) snap[k] = toNum(items[k]);
+    return snap;
+  }
+
+  function gainsText(before, after) {
+    const name = (k) => (LOOT.find(([x]) => x === k) || [])[1]
+      || `${k.replace(/_intel_stat_item$/, '').split('_').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')} intel`;
+    return Object.keys(after).filter((k) => after[k] > (before[k] || 0)).map((k) => `+${after[k] - (before[k] || 0)} ${name(k)}`).join(', ');
+  }
+
+  // Each problem is logged once when it starts and (if it has a clear message) once when it clears.
+  function problemsFor(s) {
+    const out = {};
+    const pick = cfg.spiceMode;
+    if ((pick === 'romano' || pick === 'bocconcini') && s[pick] <= 0) {
+      out[`out:${pick}`] = [`⚠ Out of ${BAITS[pick].label}, using Swiss`, `✔ ${BAITS[pick].label} back in stock`];
+    }
+    if (s.swiss <= 0) out['out:swiss'] = ['⚠ Out of Sky Pirate Swiss', '✔ Sky Pirate Swiss back in stock'];
+    if (cfg.autoLaunch && !s.isShipping && !s.isIntercepting) {
+      const { sh, allCapped } = pickShipment(s);
+      if (!sh && allCapped) out.capped = ['⚠ All affordable routes at 50 intel', ''];
+      else if (!sh) out.broke = ['⚠ No shipment affordable above reserves', ''];
+    }
+    return out;
+  }
+
+  function setProblems(now) {
+    for (const [k, msg] of Object.entries(now)) {
+      if (!(k in events.problems)) { log(msg[0]); events.problems[k] = msg[1]; }
+    }
+    for (const k of Object.keys(events.problems)) {
+      if (!now[k]) { if (events.problems[k] !== '') log(events.problems[k]); delete events.problems[k]; }
+    }
+  }
+
+  function trackEvents(s, u) {
+    if (u.has_puzzle) {
+      if (!events.problems.kr) { log("⚠ King's Reward, paused"); events.problems.kr = "✔ King's Reward solved"; saveEvents(); }
+      return;
+    }
+    setProblems(problemsFor(s));   // also clears the King's Reward entry
+    const fresh = (t) => Date.now() - (t || 0) < 60000;   // started by the script just now, or already under way
+    if (s.isShipping && !events.ship) {
+      const name = `${SHIP_SHORT[s.shipType] || 'Unknown'} Shipment`;
+      events.ship = { name, items: lootSnapshot(s) };
+      log(`✈ ${name} ${fresh(rt.launchedAt) ? 'launched' : 'in flight'}${s.baitKey ? ` (${BAITS[s.baitKey].label})` : ''}`);
+    } else if (!s.isShipping && events.ship) {
+      const gains = gainsText(events.ship.items, lootSnapshot(s));
+      log(`⚓ ${events.ship.name} back${gains ? `: ${gains}` : ''}`);
+      events.ship = null;
+    }
+    if (s.isIntercepting && !events.raid) {
+      events.raid = s.raid.name;
+      log(`⚔ ${s.raid.name} raid ${fresh(rt.raidStartedAt) ? 'started' : 'under way'}`);
+    } else if (!s.isIntercepting && events.raid) {
+      log(`⚔ ${events.raid} raid finished`);
+      events.raid = null;
+    }
+    saveEvents();
+  }
+
   // Status line parts: a coloured dot (kind), a bold lead word and the detail text.
   // kind: ok (in flight), idle (docked), pause (Pause toggle), work (raid / acting), err (failing, KR).
   function planStatus(s, plan) {
@@ -1190,7 +1330,7 @@
     const detail = String(plan.status)
       .replace(/^In flight: /, '')
       .replace(/^Raid: /, '')
-      .replace(/(^|· )Docked( — )?/, '$1')
+      .replace(/(^|· )Docked(, )?/, '$1')
       .replace(/\s*·\s*$/, '')
       .replace(/ armed\b/, () => {
         const qty = s.bait.armed ? (s.baitKey ? s[s.baitKey] : s.bait.qty) : null;
@@ -1210,6 +1350,7 @@
       if (!u) { rt.status = { kind: 'idle', lead: 'Waiting for game…', detail: '' }; return; }
       const s = readState();
       if (!s) { rt.status = { kind: 'idle', lead: 'Not at Cerulean Skyport', detail: 'travel there to use the autopilot' }; return; }
+      try { trackEvents(s, u); } catch (e) { console.warn(`[${SCRIPT}] events`, e); }
       if (u.has_puzzle) { rt.status = { kind: 'err', lead: "King's Reward", detail: 'paused until it is solved' }; return; }
 
       const wait = COOLDOWN_MS - (Date.now() - rt.lastAction);
@@ -1219,7 +1360,7 @@
       rt.status = planStatus(s, plan);
       if (plan.run && !cfg.dryRun) {
         updateUI();
-        await runAction(plan.kind, plan.label, plan.run);
+        await runAction(plan.kind, plan.label, plan.run, plan.done);
       }
     } catch (e) {
       log(`tick error: ${(e && e.message) || e}`, 'error');
@@ -1246,6 +1387,7 @@
 #${PANEL_ID} .mhcs-min{background:none;border:1px solid #4a5263;color:#e6e9ef;border-radius:4px;width:22px;height:20px;
   line-height:16px;cursor:pointer;padding:0;}
 #${PANEL_ID}.mhcs-collapsed .mhcs-body{display:none;}
+#${PANEL_ID} .mhcs-toggles{display:grid;grid-template-columns:1fr 1fr;gap:0 8px;}
 #${PANEL_ID} .mhcs-body{padding:8px 10px 10px;max-height:calc(100vh - 60px);overflow:auto;}
 #${PANEL_ID}{--ok:#56d364;--idle:#8b93a3;--pause:#e3b341;--work:#58a6ff;--err:#ff7b72;}
 #${PANEL_ID} .mhcs-status{display:flex;gap:7px;align-items:baseline;color:#aab2c0;margin-bottom:6px;}
@@ -1264,37 +1406,47 @@
 #${PANEL_ID} .mhcs-sec{border-top:1px solid #303747;padding-top:6px;margin-top:6px;}
 #${PANEL_ID} label{display:flex;align-items:center;gap:6px;margin:3px 0;color:#e6e9ef !important;font:inherit;}
 #${PANEL_ID} label.mhcs-row{justify-content:space-between;}
+#${PANEL_ID} label.mhcs-stack{flex-direction:column;align-items:stretch;gap:3px;}
+#${PANEL_ID} label.mhcs-stack select{max-width:none;width:100%;}
+#${PANEL_ID} .mhcs-reset{display:block;margin:8px 0 0 auto;background:none;border:0;padding:0;color:#8b93a3;font:inherit;font-size:11px;text-decoration:underline;cursor:pointer;}
+#${PANEL_ID} .mhcs-reset:hover,#${PANEL_ID} .mhcs-reset.mhcs-armed{color:var(--err);}
+#${PANEL_ID} .mhcs-subhead{color:#8b93a3;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;margin:8px 0 2px;}
+#${PANEL_ID} .mhcs-subhead:first-of-type{margin-top:4px;}
+#${PANEL_ID} .mhcs-pause{flex:none;margin-right:6px;padding:1px 8px;height:20px;border-radius:999px;cursor:pointer;font:600 11px/16px -apple-system,Segoe UI,Roboto,Arial,sans-serif;white-space:nowrap;border:1px solid var(--pause);background:color-mix(in srgb,var(--pause) 18%,transparent);color:var(--pause);}
+#${PANEL_ID}.mhcs-is-paused .mhcs-hstate{display:none;}
+#${PANEL_ID} .mhcs-pause:hover{background:color-mix(in srgb,var(--pause) 28%,transparent);}
+#${PANEL_ID} .mhcs-pause.mhcs-running{border-color:color-mix(in srgb,var(--ok) 55%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent);color:var(--ok);}
+#${PANEL_ID} .mhcs-pause.mhcs-running:hover{background:color-mix(in srgb,var(--ok) 18%,transparent);}
 #${PANEL_ID} select,#${PANEL_ID} input[type=number]{background:#11151b;color:#e6e9ef;border:1px solid #3a4150;border-radius:4px;
   padding:2px 4px;font:inherit;}
 #${PANEL_ID} select{max-width:165px;}
 #${PANEL_ID} input[type=number]{width:70px;}
-#${PANEL_ID} .mhcs-btn{background:#7c5cff;color:#fff;border:0;border-radius:4px;padding:3px 10px;cursor:pointer;font:inherit;}
 #${PANEL_ID} .mhcs-tip{position:absolute;left:8px;right:8px;z-index:3;display:none;pointer-events:none;background:#0d1117;color:#e6e9ef;border:1px solid #3a4150;border-radius:6px;padding:6px 8px;font-size:11px;line-height:1.4;box-shadow:0 4px 12px rgba(0,0,0,.5);}
 #${PANEL_ID} summary{cursor:pointer;color:#8b93a3;user-select:none;}
 #${PANEL_ID} summary:hover{color:#e6e9ef;}
-#${PANEL_ID} .mhcs-log{margin-top:4px;font:11px/1.35 Consolas,monospace;color:#aab2c0;white-space:pre-wrap;word-break:break-word;}
+#${PANEL_ID} .mhcs-log{margin-top:4px;max-height:180px;overflow-y:auto;font:11px/1.35 Consolas,monospace;color:#aab2c0;white-space:pre-wrap;word-break:break-word;}
 `;
 
   const TOGGLES = [
-    ['dryRun', 'Pause',
-      'Stops the script from acting. It keeps watching and shows what it would do next in the status line. Untick to let the script play. Handy for trying a new version safely.'],
-    ['autoLaunch', 'Auto Airship Launch',
-      `When docked, launches the best shipment you can afford without dipping below your Min reserves (Spice, then Cloudstone, then Gas). Skips locations that already have ${INTEL_CAP} intel.`],
-    ['autoBait', 'Auto Bait Swap',
-      'Arms the right cheese for you: Swiss or Bocconcini during a shipment (see Spice bait), Bocconcini for raids, and your Docked bait while docked. Off: the script never touches your bait.'],
-    ['autoCraft', `Auto Craft Sky Pirate Swiss (&lt; ${MIN_SWISS})`,
-      `Crafts Sky Pirate Swiss from Curd + Essence when you have fewer than ${MIN_SWISS} and need it. Also crafts Aurora Bocconcini from Spice + Essence to reach ${RAID_MIN_BOCCONCINI} before a raid.`],
-    ['autoRaid', `Auto Raid (intel ≥ ${INTEL_CAP}, ${RAID_MIN_BOCCONCINI}+ Bocconcini)`,
-      `Starts a raid once a location reaches ${INTEL_CAP} intel, on Bocconcini. Arms your luckiest weapon that can reach minluck, adds luck charms if needed, and puts your trap back after the raid.`],
+    ['autoLaunch', 'Auto Launch',
+      `Launches the best affordable shipment, keeping your reserves. Skips locations with ${INTEL_CAP}+ intel.`],
+    ['autoBait', 'Auto Bait',
+      'Arms your Shipment bait in flight, Bocconcini on raids, and your Docked bait at the dock.'],
+    ['autoCraft', 'Auto Craft',
+      `Crafts Sky Pirate Swiss below ${MIN_SWISS}, and Aurora Bocconcini up to ${RAID_MIN_BOCCONCINI} before a raid. See Crafting in Settings.`],
+    ['autoRaid', 'Auto Raid',
+      `Starts a raid at ${INTEL_CAP} intel with ${RAID_MIN_BOCCONCINI}+ Bocconcini, using your luckiest weapon. Restores your trap after.`],
   ];
 
   const SETTING_TOGGLES = [
-    ['luckCharmsNormal', 'Luck charms on shipments too',
-      `Luck charms are already used automatically on raids. Turn this on to also use them on shipments, to reach minluck for the mice there. Only charms you hold more than ${CHARM_MIN_QTY} of are used.`],
+    ['luckCharmsRaid', 'Luck charms on raids',
+      'If your luck is below minluck, arms the weakest charm that closes the gap (or your strongest). Removed after the raid.'],
+    ['luckCharmsNormal', 'Luck charms on shipments',
+      'Same charm choice as raids, during shipments.'],
   ];
 
   const HTML = `
-<div class="mhcs-head"><span class="mhcs-title">☁ ${SCRIPT}</span><span class="mhcs-hstate"><i class="mhcs-dot"></i><span data-f="hlead"></span></span><button class="mhcs-min" type="button" title="Minimize">–</button></div>
+<div class="mhcs-head"><span class="mhcs-title">☁ ${SCRIPT}</span><span class="mhcs-hstate"><i class="mhcs-dot"></i><span data-f="hlead"></span></span><button class="mhcs-pause" type="button" data-a="pause" data-tip="Paused: shows what it would do without acting. Click to switch."></button><button class="mhcs-min" type="button" title="Minimize">–</button></div>
 <div class="mhcs-body">
   <div class="mhcs-status"><i class="mhcs-dot"></i><span data-f="status"></span></div>
   <details class="mhcs-sec" data-fold="showResources"><summary>Resources</summary>
@@ -1303,28 +1455,45 @@ ${RESOURCE_GROUPS.map(([group, items]) => `  <div class="mhcs-group">${group}</d
     `<span><img src="${IMG}${img}" alt="">${name} <b data-r="${key}"></b></span>`).join('')}</div>
 `).join('')}  </details>
   <div class="mhcs-sec">
+    <div class="mhcs-toggles">
 ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="checkbox" data-c="${key}"> ${text}</label>
-`).join('')}  </div>
+`).join('')}    </div>
+  </div>
   <details class="mhcs-sec" data-fold="showSettings"><summary>Settings</summary>
-    <label class="mhcs-row" data-tip="Cheese for Spice Shipments. Swiss: more Aurora Spice. Bocconcini: Spice boss (needs 20+). Raids always use Bocconcini."><span>Spice bait</span>
+    <div class="mhcs-subhead">Bait</div>
+    <label class="mhcs-stack" data-tip="Cheese for every shipment. Romano or Bocconcini while you have any, then Swiss."><span>Shipment bait</span>
       <select data-c="spiceMode">
-        <option value="swiss">Sky Pirate Swiss (Farm Spice)</option>
-        <option value="bocconcini">Aurora Bocconcini (if &gt;= ${MIN_BOCCONCINI}, else Swiss)</option>
+        <option value="swiss">Sky Pirate Swiss</option>
+        <option value="romano">Sky Raider Romano</option>
+        <option value="bocconcini">Aurora Bocconcini</option>
       </select></label>
-    <label class="mhcs-row" data-tip="Bait while idle at the dock. Gouda or SUPER|brie+: farms Curd for Swiss. Disarm: no hunting."><span>Docked bait</span>
+    <label class="mhcs-stack" data-tip="Bait while docked. Gouda or SUPER|brie+ farm Curd for Swiss."><span>Docked bait</span>
       <select data-c="dockedAction">
-        <option value="gouda">Swap to Gouda</option>
-        <option value="superbrie">Swap to SUPER|brie+</option>
+        <option value="gouda">Gouda</option>
+        <option value="superbrie">SUPER|brie+</option>
         <option value="disarm">Disarm</option>
         <option value="none">Leave as-is</option>
       </select></label>
+    <div class="mhcs-subhead">Luck Charms</div>
 ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="checkbox" data-c="${key}"> ${text}</label>
-`).join('')}    <label class="mhcs-row" data-tipfor="minDebris"><span>Min Debris</span> <input type="number" min="0" step="1" data-c="minDebris"></label>
+`).join('')}    <label class="mhcs-row" data-tip="Only charms you hold more of than this are used. 0 = any."><span>Min charms to use</span> <input type="number" min="0" step="1" data-c="charmMinQty"></label>
+    <div class="mhcs-subhead">Cannonballs</div>
+    <label class="mhcs-stack" data-tip="Only with enough: needs one per raid hunt left (25 for a full raid). Off: leaves the switch alone."><span>Cannonballs on raids</span>
+      <select data-c="cannonRaid">
+        <option value="off">Off</option>
+        <option value="enough">Only with enough (25+)</option>
+        <option value="always">Always</option>
+      </select></label>
+    <label data-tip="Uses cannonballs during shipments while you have any."><input type="checkbox" data-c="cannonShip"> Cannonballs on shipments</label>
+    <div class="mhcs-subhead">Crafting</div>
+    <label data-tip="On: crafts with Essence (2 cheese per craft), Gold if out of Essence. Off: Gold only (1 cheese per craft)."><input type="checkbox" data-c="craftEssence"> Use Magic Essence (Recommended)</label>
+    <div class="mhcs-subhead">Reserves</div>
+    <label class="mhcs-row" data-tipfor="minDebris"><span>Min Debris</span> <input type="number" min="0" step="1" data-c="minDebris"></label>
     <label class="mhcs-row" data-tipfor="minGas"><span>Min Gas</span> <input type="number" min="0" step="1" data-c="minGas"></label>
     <label class="mhcs-row" data-tipfor="minCloudstone"><span>Min Cloudstone</span> <input type="number" min="0" step="1" data-c="minCloudstone"></label>
+    <button class="mhcs-reset" type="button" data-a="reset" data-tip="Restores every setting, including Pause. Click twice.">Reset to defaults</button>
   </details>
   <details class="mhcs-sec" data-fold="showLog"><summary>Log</summary><div class="mhcs-log" data-f="log"></div></details>
-  <div class="mhcs-sec"><button class="mhcs-btn" type="button" data-a="run" data-tip="Check and act immediately, skipping the 60s pause after a failed action and the wait after a craft. Use it after fixing something by hand; otherwise the script checks every few seconds on its own.">Run now</button></div>
 </div>`;
 
   let panel = null;
@@ -1345,7 +1514,7 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
       const def = SHIPMENTS.find((x) => x.type === t.ship);
       const live = s && s.shipments[t.ship];
       const cost = live && live.cost != null ? live.cost : def.cost;
-      const text = `Always keep ${min} ${t.item}. ${t.shipLabel} Shipments (${cost} ${t.item}) only launch at ${min + cost}+ ${t.item}.`;
+      const text = `Keeps ${min} ${t.item}. ${t.shipLabel} Shipments (${cost}) launch at ${min + cost}+.`;
       el.dataset.tip = text;
     }
   }
@@ -1362,6 +1531,7 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
       const row = e.target.closest('[data-tip]');
       if (!row || row.contains(e.relatedTarget)) return;
       hide();
+      if (panel.classList.contains('mhcs-collapsed')) return;   // no room inside a minimised panel
       timer = setTimeout(() => {
         tip.textContent = row.dataset.tip;
         tip.style.display = 'block';
@@ -1407,10 +1577,15 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
       el.addEventListener('toggle', () => { cfg[key] = el.open; saveConfig(); });
     }
 
+    const syncInputs = () => {
+      for (const el of panel.querySelectorAll('[data-c]')) {
+        if (el.type === 'checkbox') el.checked = !!cfg[el.dataset.c];
+        else el.value = cfg[el.dataset.c];
+      }
+    };
+    syncInputs();
     for (const el of panel.querySelectorAll('[data-c]')) {
       const key = el.dataset.c;
-      if (el.type === 'checkbox') el.checked = !!cfg[key];
-      else el.value = cfg[key];
       el.addEventListener('change', () => {
         if (el.type === 'checkbox') cfg[key] = el.checked;
         else if (el.type === 'number') {
@@ -1425,12 +1600,44 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
       });
     }
 
-    panel.querySelector('[data-a="run"]').addEventListener('click', () => {
+    const pauseBtn = panel.querySelector('[data-a="pause"]');
+    const showPause = () => {
+      pauseBtn.textContent = cfg.dryRun ? '❚❚ Paused' : '▶ Running';
+      pauseBtn.classList.toggle('mhcs-running', !cfg.dryRun);
+      panel.classList.toggle('mhcs-is-paused', !!cfg.dryRun);   // the pill already says Paused
+    };
+    showPause();
+    pauseBtn.addEventListener('click', () => {
+      cfg.dryRun = !cfg.dryRun;
+      saveConfig();
+      showPause();
+      log(cfg.dryRun ? 'Paused' : 'Running');
       rt.backoff = {};
-      rt.lastCraft = null;
-      log('Manual run requested');
-      scheduleTick(0);
+      scheduleTick(300);
     });
+
+    const resetBtn = panel.querySelector('[data-a="reset"]');
+    let resetTimer = null;
+    resetBtn.addEventListener('click', () => {
+      if (!resetBtn.classList.contains('mhcs-armed')) {
+        resetBtn.classList.add('mhcs-armed');
+        resetBtn.textContent = 'Click again to reset';
+        resetTimer = setTimeout(() => { resetBtn.classList.remove('mhcs-armed'); resetBtn.textContent = 'Reset to defaults'; }, 4000);
+        return;
+      }
+      clearTimeout(resetTimer);
+      for (const k of Object.keys(DEFAULTS)) if (k !== 'minimized' && !k.startsWith('show')) cfg[k] = DEFAULTS[k];
+      saveConfig();
+      syncInputs();
+      showPause();
+      refreshTips(readState());
+      resetBtn.classList.remove('mhcs-armed');
+      resetBtn.textContent = 'Reset to defaults';
+      log('✔ Settings reset to defaults');
+      rt.backoff = {};
+      scheduleTick(300);
+    });
+
   }
 
   function renderStatus() {
@@ -1485,7 +1692,7 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
         updateUI();
       });
     } else {
-      log('jQuery not found — relying on heartbeat only', 'error');
+      log('jQuery not found, relying on heartbeat only', 'error');
     }
 
     setInterval(() => { if (!rt.tickTimer) tick(); }, HEARTBEAT_MS);
@@ -1498,6 +1705,6 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
 
   waitFor(() => window.user && document.body && document.head, 30000, 500).then((ok) => {
     if (ok) init();
-    else console.warn(`[${SCRIPT}] window.user never appeared — not starting`);
+    else console.warn(`[${SCRIPT}] window.user never appeared, not starting`);
   });
 })();
