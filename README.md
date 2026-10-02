@@ -4,7 +4,7 @@ Tampermonkey userscripts for [MouseHunt](https://www.mousehuntgame.com).
 
 | Script | What it does | License |
 |---|---|---|
-| [Auto Disarm/Swap Bait](mousehunt-auto-disarm-swap-bait.user.js) | Disarms your trap or swaps to your chosen cheese when bait runs low. | GPL-3.0 |
+| [Auto Disarm/Swap Bait](mousehunt-auto-disarm-swap-bait.user.js) | Disarms your trap or swaps to your chosen cheese when bait runs low. | MIT |
 | [Auto Horn & KR Solver](mousehunt-auto-horn.user.js) | Sounds the horn after a random delay and solves King's Rewards. | MIT |
 | [Cerulean Skyport Autopilot](cerulean-skyport-autopilot.user.js) | Launches shipments, swaps bait, crafts cheese and starts raids at Cerulean Skyport. | MIT |
 
@@ -18,10 +18,9 @@ Tampermonkey userscripts for [MouseHunt](https://www.mousehuntgame.com).
 
 The scripts work on their own and also together: Auto Horn and Auto Disarm/Swap Bait wait while the Skyport Autopilot is in the middle of an action.
 
-## Licenses
+## License
 
-- Auto Horn & KR Solver and Cerulean Skyport Autopilot: MIT, see [LICENSE-MIT](LICENSE-MIT).
-- Auto Disarm/Swap Bait: GPL-3.0 or later, see [LICENSE-GPL-3.0](LICENSE-GPL-3.0).
+All three scripts are MIT licensed, see [LICENSE](LICENSE).
 
 ## Credits
 

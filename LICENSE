@@ -1,8 +1,9 @@
 MIT License
 
-Applies to: mousehunt-auto-horn.user.js, cerulean-skyport-autopilot.user.js
+Applies to all scripts in this repository: mousehunt-auto-disarm-swap-bait.user.js,
+mousehunt-auto-horn.user.js and cerulean-skyport-autopilot.user.js.
 
-Copyright (c) 2026 Kane
+Copyright (c) 2023-2026 Kane
 
 mousehunt-auto-horn.user.js is based on "Mousehunt Auto Horn & KR Solver":
 Copyright (c) 2023 Daniel Lok

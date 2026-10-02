@@ -8,7 +8,7 @@
 // @match        https://www.mousehuntgame.com/*
 // @icon         https://www.mousehuntgame.com/favicon.ico
 // @grant        none
-// @license      GPL-3.0+
+// @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/467434/MouseHunt%20Auto%20DisarmSwap%20Bait.user.js
 // @updateURL https://update.greasyfork.org/scripts/467434/MouseHunt%20Auto%20DisarmSwap%20Bait.meta.js
 // ==/UserScript==
