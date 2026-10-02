@@ -1,0 +1,6 @@
+# Local working notes and third-party reference code (not ours to publish)
+CLAUDE.md
+docs/
+minluck-cre-tool.user.js
+prototype-*.html
+.claude/
