@@ -3,7 +3,7 @@
 // @author       Kane
 // @namespace    https://greasyfork.org/en/users/979741
 // @version      5.5
-// @description  Automate your bait management in MouseHunt! Automatically disarms your trap or swaps to your chosen cheese when bait drops to or below your target quantity. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
+// @description  Disarms your trap or swaps to the cheese you choose when your bait drops to a set quantity. Waits for confirmation, retries if the game refuses, and pauses during King's Rewards. Pairs with MouseHunt Auto Horn & KR Solver (Kane) and Cerulean Skyport Autopilot (Kane).
 // @match        https://mousehuntgame.com/*
 // @match        https://www.mousehuntgame.com/*
 // @icon         https://www.mousehuntgame.com/favicon.ico
