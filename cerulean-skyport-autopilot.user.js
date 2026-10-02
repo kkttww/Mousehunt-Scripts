@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MouseHunt Cerulean Skyport Autopilot (Kane)
 // @namespace    https://greasyfork.org/en/users/979741
-// @version      1.0.1
+// @version      1.0.2
 // @description  Runs Cerulean Skyport for you: launches airship shipments, swaps bait, crafts Sky Pirate Swiss and Aurora Bocconcini, and starts raids with the luckiest weapon and luck charms. Starts paused so you can check its plan first. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
 // @author       Kane
 // @license      MIT
@@ -44,6 +44,8 @@
   const CHARM_MIN_QTY = 300;         // default for cfg.charmMinQty
   const BOCC_SPICE_PER_CRAFT = 8;    // Bocconcini: 8 Spice + 1 Essence -> 2, or 8 Spice + 5,000 Gold -> 1
   const BOCC_GOLD_PER_CRAFT = 5000;
+  const LOG_MAX = 20;                // log lines kept
+  const LOG_KEY = 'mhCeruleanSkyport.log.v1';   // kept across page refreshes
   const FALLBACK_LUCK = 100;         // luck target when minluck can't be worked out
 
   // Mouse power and effectiveness (% per power type, POWER_TYPES order) for Cerulean Skyport and its raid
@@ -313,13 +315,12 @@
     lastCraft: null,    // { which, before, at }
     tickTimer: null,
     status: { kind: 'idle', lead: 'Starting…', detail: '' },
-    log: [],
+    log: loadLog(),
   };
 
   /* ------------------------------------------------------------------ *
    * Helpers
    * ------------------------------------------------------------------ */
-  const LOG_MAX = 20;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const $1 = (sel, root) => (root || document).querySelector(sel);
 
@@ -358,10 +359,16 @@
     }
   }
 
+  function loadLog() {
+    try { const l = JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); return Array.isArray(l) ? l.slice(0, LOG_MAX) : []; }
+    catch (e) { return []; }
+  }
+
   function log(msg, level) {
     const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     rt.log.unshift(`${t}  ${msg}`);
     if (rt.log.length > LOG_MAX) rt.log.length = LOG_MAX;
+    try { localStorage.setItem(LOG_KEY, JSON.stringify(rt.log)); } catch (e) { /* storage unavailable */ }
     (level === 'error' ? console.warn : console.log)(`[${SCRIPT}] ${msg}`);
     updateUI();
   }

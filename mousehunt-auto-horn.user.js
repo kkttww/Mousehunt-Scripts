@@ -1896,7 +1896,8 @@
 #${UI_ID} label{display:flex;justify-content:space-between;align-items:center;gap:8px;color:#e6e9ef;}
 #${UI_ID} input{width:78px;box-sizing:border-box;text-align:left;background:#11151b;color:#e6e9ef;border:1px solid #3a4150;border-radius:4px;padding:3px 4px 3px 8px;font:inherit;font-weight:600;color-scheme:dark;}
 #${UI_ID} input:focus{border-color:#58a6ff;outline:none;}
-#${UI_ID} .mhah-reset{margin-top:6px;background:none;border:0;color:#9ecbff;cursor:pointer;padding:2px 0;font-size:11px;text-decoration:underline;}
+#${UI_ID} .mhah-reset{display:block;margin:8px 0 0 auto;background:none;border:0;padding:0;color:#8b93a3;font:inherit;font-size:11px;text-decoration:underline;cursor:pointer;}
+#${UI_ID} .mhah-reset:hover,#${UI_ID} .mhah-reset.mhah-armed{color:#ff7b72;}
 #${UI_ID} .mhah-tip{position:absolute;z-index:3;display:none;pointer-events:none;max-width:300px;background:#0d1117;color:#e6e9ef;
   border:1px solid #3a4150;border-radius:6px;padding:6px 8px;font-size:11px;line-height:1.4;box-shadow:0 4px 12px rgba(0,0,0,.5);}
 `;
@@ -1976,7 +1977,7 @@
     bar.id = UI_ID;
     bar.innerHTML = `<span class="mhah-title">Auto Horn</span><span class="mhah-dot"></span><span class="mhah-status"></span>
 <button class="mhah-toggle" type="button"></button>
-<div class="mhah-settings" hidden><div class="mhah-grid"></div><button class="mhah-reset" type="button">Reset to defaults</button></div>`;
+<div class="mhah-settings" hidden><div class="mhah-grid"></div><button class="mhah-reset" type="button" data-tip="Restores every setting. Click twice.">Reset to defaults</button></div>`;
     statusEl = bar.querySelector('.mhah-status');
     dotEl = bar.querySelector('.mhah-dot');
     const grid = bar.querySelector('.mhah-grid');
@@ -2012,11 +2013,23 @@
     };
     showSettings(false);
     toggle.addEventListener('click', () => showSettings(settings.hidden));
-    bar.querySelector('.mhah-reset').addEventListener('click', () => {
+    const resetBtn = bar.querySelector('.mhah-reset');
+    let resetTimer = null;
+    resetBtn.addEventListener('click', () => {
+      if (!resetBtn.classList.contains('mhah-armed')) {
+        resetBtn.classList.add('mhah-armed');
+        resetBtn.textContent = 'Click again to reset';
+        resetTimer = setTimeout(() => { resetBtn.classList.remove('mhah-armed'); resetBtn.textContent = 'Reset to defaults'; }, 4000);
+        return;
+      }
+      clearTimeout(resetTimer);
       Object.assign(cfg, DEFAULTS);
       saveConfig();
       for (const [key] of FIELDS) inputs[key].value = cfg[key];
       st.hornAt = 0;
+      resetBtn.classList.remove('mhah-armed');
+      resetBtn.textContent = 'Reset to defaults';
+      log('Settings reset to defaults');
     });
     host.insertBefore(bar, host.firstChild);
     fillHostEdges(bar, host);
