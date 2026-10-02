@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MouseHunt Auto Horn & KR Solver (Kane)
 // @namespace    https://greasyfork.org/en/users/979741
-// @version      1.0.0
+// @version      1.0.1
 // @description  Sounds the hunter's horn after a random delay you choose and auto-solves King's Rewards. Never stops silently, reloads only when needed, and flags the tab if a King's Reward needs you. Pairs with MouseHunt Auto Disarm/Swap Bait (Kane) and Cerulean Skyport Autopilot (Kane).
 // @author       Kane
 // @license      MIT
