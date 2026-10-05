@@ -519,11 +519,11 @@
   // only on Aurora Spice shipments; `useMin`: Min Bocconcini to keep applies. `hint` is shown in the panel.
   const BAIT_MODES = {
     swiss: { cheese: null, hint: 'Swiss on every shipment.' },
-    romano: { cheese: 'romano', hint: 'Romano on every shipment. Out of Romano: Swiss on every shipment.' },
+    romano: { cheese: 'romano', hint: 'Romano on every shipment; Swiss on all when out.' },
     bocconcini: { cheese: 'bocconcini', useMin: true,
-      hint: 'Bocconcini on every shipment. Out of Bocconcini (or at your minimum): Swiss on every shipment.' },
+      hint: 'Bocconcini on every shipment; Swiss on all when out or at the minimum.' },
     bocconcini_spice: { cheese: 'bocconcini', spiceOnly: true, useMin: true,
-      hint: 'Spice: Bocconcini · Cloudstone and Gas: Swiss. Out of Bocconcini (or at your minimum): Swiss on every shipment.' },
+      hint: 'Bocconcini on Spice, Swiss on the rest; Swiss on all when out or at the minimum.' },
   };
   const baitMode = (c = cfg) => BAIT_MODES[c.spiceMode] || BAIT_MODES.swiss;
 
@@ -1722,8 +1722,6 @@
 #${PANEL_ID} .mhcs-sec{border-top:1px solid #303747;padding-top:6px;margin-top:6px;}
 #${PANEL_ID} label{display:flex;align-items:center;gap:6px;margin:3px 0;color:#e6e9ef !important;font:inherit;}
 #${PANEL_ID} label.mhcs-row{justify-content:space-between;}
-#${PANEL_ID} label.mhcs-stack{flex-direction:column;align-items:stretch;gap:3px;}
-#${PANEL_ID} label.mhcs-stack select{max-width:none;width:100%;}
 #${PANEL_ID} .mhcs-reset{display:block;margin:8px 0 0 auto;background:none;border:0;padding:0;color:#8b93a3;font:inherit;font-size:11px;text-decoration:underline;cursor:pointer;}
 #${PANEL_ID} .mhcs-reset:hover,#${PANEL_ID} .mhcs-reset.mhcs-armed{color:var(--err);}
 #${PANEL_ID} label.mhcs-bocc{display:none;}
@@ -1738,7 +1736,7 @@
 #${PANEL_ID} .mhcs-pause.mhcs-running:hover{background:color-mix(in srgb,var(--ok) 18%,transparent);}
 #${PANEL_ID} select,#${PANEL_ID} input[type=number]{background:#11151b;color:#e6e9ef;border:1px solid #3a4150;border-radius:4px;
   padding:2px 4px;font:inherit;}
-#${PANEL_ID} select{max-width:165px;}
+#${PANEL_ID} select{width:150px;}
 #${PANEL_ID} input[type=number]{width:70px;}
 #${PANEL_ID} .mhcs-tip{position:absolute;left:8px;right:8px;z-index:3;display:none;pointer-events:none;background:#0d1117;color:#e6e9ef;border:1px solid #3a4150;border-radius:6px;padding:6px 8px;font-size:11px;line-height:1.4;box-shadow:0 4px 12px rgba(0,0,0,.5);}
 #${PANEL_ID} summary{cursor:pointer;color:#8b93a3;user-select:none;}
@@ -1747,23 +1745,14 @@
 `;
 
   const TOGGLES = [
-    ['autoLaunch', 'Auto Launch',
-      `Launches the best affordable shipment, keeping your reserves. Skips locations with ${INTEL_CAP}+ intel.`],
-    ['autoBait', 'Auto Bait',
-      'Arms your Shipment bait in flight, Bocconcini on raids, and your Docked bait at the dock.'],
-    ['autoCraft', 'Auto Craft',
-      `Crafts Sky Pirate Swiss below ${MIN_SWISS}, and Aurora Bocconcini up to ${RAID_MIN_BOCCONCINI} before a raid. See Crafting in Settings.`],
-    ['autoRaid', 'Auto Raid',
-      `Starts a raid at ${INTEL_CAP} intel with ${RAID_MIN_BOCCONCINI}+ Bocconcini, using your luckiest weapon. Restores your trap after.`],
-  ];
-
-  const SETTING_TOGGLES = [
-    ['luckCharmsRaid', 'Luck charms on raids',
-      'If your luck is below minluck, arms the weakest charm that closes the gap (or your strongest). Removed after the raid.'],
+    ['autoLaunch', 'Auto Launch', `Launches the best affordable shipment above your reserves. Skips ${INTEL_CAP}+ intel.`],
+    ['autoBait', 'Auto Bait', 'Arms the right bait in flight, on raids and docked.'],
+    ['autoCraft', 'Auto Craft', `Crafts Swiss below ${MIN_SWISS}, and ${RAID_MIN_BOCCONCINI} Bocconcini before a raid.`],
+    ['autoRaid', 'Auto Raid', `Starts a raid at ${INTEL_CAP} intel with ${RAID_MIN_BOCCONCINI}+ Bocconcini. Restores your trap after.`],
   ];
 
   const HTML = `
-<div class="mhcs-head"><span class="mhcs-title">☁ ${SCRIPT}</span><span class="mhcs-hstate"><i class="mhcs-dot"></i><span data-f="hlead"></span></span><button class="mhcs-pause" type="button" data-a="pause" data-tip="Paused: shows what it would do without acting. Click to switch."></button><button class="mhcs-min" type="button" title="Minimize">–</button></div>
+<div class="mhcs-head"><span class="mhcs-title">☁ ${SCRIPT}</span><span class="mhcs-hstate"><i class="mhcs-dot"></i><span data-f="hlead"></span></span><button class="mhcs-pause" type="button" data-a="pause" data-tip="Paused: shows what it would do, without acting."></button><button class="mhcs-min" type="button" title="Minimize">–</button></div>
 <div class="mhcs-body">
   <div class="mhcs-status"><i class="mhcs-dot"></i><span data-f="status"></span></div>
   <details class="mhcs-sec" data-fold="showResources"><summary>Resources</summary>
@@ -1777,49 +1766,49 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
 `).join('')}    </div>
   </div>
   <details class="mhcs-sec" data-fold="showSettings"><summary>Settings</summary>
-    <div class="mhcs-subhead">Bait</div>
-    <label class="mhcs-stack" data-tip="Cheese for shipments. Whenever the chosen cheese runs out (or Bocconcini reaches your minimum), every shipment uses Sky Pirate Swiss."><span>Shipment bait</span>
+    <div class="mhcs-subhead">Shipments</div>
+    <label class="mhcs-row"><span>Bait</span>
       <select data-c="spiceMode">
         <option value="swiss">Sky Pirate Swiss</option>
         <option value="romano">Sky Raider Romano</option>
         <option value="bocconcini">Aurora Bocconcini</option>
-        <option value="bocconcini_spice">Aurora Bocconcini (Spice only)</option>
+        <option value="bocconcini_spice">Bocconcini, Spice only</option>
       </select></label>
     <div class="mhcs-hint" data-f="baitHint"></div>
-    <label class="mhcs-row mhcs-bocc" data-tip="Switches to Swiss when Bocconcini drops to this, so some stay for raids (a raid needs ${RAID_MIN_BOCCONCINI}). 0 = no minimum."><span>Min Bocconcini to keep</span> <input type="number" min="0" step="1" data-c="boccMin"></label>
-    <label class="mhcs-stack" data-tip="Bait while docked. Gouda or SUPER|brie+ farm Curd for Swiss."><span>Docked bait</span>
+    <label class="mhcs-row mhcs-bocc" data-tip="Keep some for raids (a raid needs ${RAID_MIN_BOCCONCINI}). 0 = none."><span>Min Bocconcini</span> <input type="number" min="0" step="1" data-c="boccMin"></label>
+    <label class="mhcs-row" data-tip="With Bocconcini: removed when another bait goes on."><span>Luck charms</span>
+      <select data-c="luckCharmsNormal">
+        <option value="off">Off</option>
+        <option value="bocconcini">With Bocconcini</option>
+        <option value="always">Always</option>
+      </select></label>
+    <label data-tip="While you have any."><input type="checkbox" data-c="cannonShip"> Cannonballs</label>
+    <div class="mhcs-subhead">Docked</div>
+    <label class="mhcs-row" data-tip="Gouda and SUPER|brie+ farm Corsair's Curds."><span>Bait</span>
       <select data-c="dockedAction">
         <option value="gouda">Gouda</option>
         <option value="superbrie">SUPER|brie+</option>
         <option value="disarm">Disarm</option>
         <option value="none">Leave as-is</option>
       </select></label>
-    <div class="mhcs-subhead">Trap</div>
-    <label data-tip="C.L.A.W. Machine while Gouda or SUPER|brie+ is armed (doubles Corsair's Curds; without one, your luckiest Law weapon). Your luckiest Law weapon on Swiss, Romano and Bocconcini shipments. Raids pick their own weapon."><input type="checkbox" data-c="autoWeapon"> Auto weapon</label>
-    <div class="mhcs-subhead">Luck Charms</div>
-${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="checkbox" data-c="${key}"> ${text}</label>
-`).join('')}    <label class="mhcs-stack" data-tip="Same charm choice as raids, during shipments. Only with Bocconcini: only while Aurora Bocconcini is armed; the charm comes off when Swiss or your docked bait goes on."><span>Luck charms on shipments</span>
-      <select data-c="luckCharmsNormal">
-        <option value="off">Off</option>
-        <option value="bocconcini">Only with Bocconcini</option>
-        <option value="always">Always</option>
-      </select></label>
-    <label class="mhcs-row" data-tip="Only charms you hold more of than this are used. 0 = any."><span>Min charms to use</span> <input type="number" min="0" step="1" data-c="charmMinQty"></label>
-    <div class="mhcs-subhead">Cannonballs</div>
-    <label class="mhcs-stack" data-tip="Only with enough: needs one per raid hunt left (25 for a full raid). Off: leaves the switch alone."><span>Cannonballs on raids</span>
+    <div class="mhcs-subhead">Raids</div>
+    <label data-tip="Closes the gap to minluck. Removed after the raid."><input type="checkbox" data-c="luckCharmsRaid"> Luck charms</label>
+    <label class="mhcs-row" data-tip="Enough: one per raid hunt left. Off: switch left alone."><span>Cannonballs</span>
       <select data-c="cannonRaid">
         <option value="off">Off</option>
-        <option value="enough">Only with enough (25+)</option>
+        <option value="enough">If enough (25+)</option>
         <option value="always">Always</option>
       </select></label>
-    <label data-tip="Uses cannonballs during shipments while you have any."><input type="checkbox" data-c="cannonShip"> Cannonballs on shipments</label>
+    <div class="mhcs-subhead">Trap</div>
+    <label data-tip="C.L.A.W. Machine with Gouda or SUPER|brie+ (double curds), else your luckiest Law weapon. Not on raids."><input type="checkbox" data-c="autoWeapon"> Auto weapon</label>
+    <label class="mhcs-row" data-tip="Only charms you hold more of. 0 = any."><span>Min charms to use</span> <input type="number" min="0" step="1" data-c="charmMinQty"></label>
     <div class="mhcs-subhead">Crafting</div>
-    <label data-tip="On: crafts with Essence (2 cheese per craft), Gold if out of Essence. Off: Gold only (1 cheese per craft)."><input type="checkbox" data-c="craftEssence"> Use Magic Essence (Recommended)</label>
+    <label data-tip="2 cheese per craft; Gold when out. Off: Gold only."><input type="checkbox" data-c="craftEssence"> Use Magic Essence</label>
     <div class="mhcs-subhead">Reserves</div>
     <label class="mhcs-row" data-tipfor="minDebris"><span>Min Debris</span> <input type="number" min="0" step="1" data-c="minDebris"></label>
     <label class="mhcs-row" data-tipfor="minGas"><span>Min Gas</span> <input type="number" min="0" step="1" data-c="minGas"></label>
     <label class="mhcs-row" data-tipfor="minCloudstone"><span>Min Cloudstone</span> <input type="number" min="0" step="1" data-c="minCloudstone"></label>
-    <button class="mhcs-reset" type="button" data-a="reset" data-tip="Restores every setting, including Pause. Click twice.">Reset to defaults</button>
+    <button class="mhcs-reset" type="button" data-a="reset" data-tip="Every setting, Pause too. Click twice.">Reset to defaults</button>
   </details>
   <details class="mhcs-sec" data-fold="showLog"><summary>Log</summary><div class="mhcs-log" data-f="log"></div></details>
 </div>`;
@@ -1842,7 +1831,7 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
       const def = SHIPMENTS.find((x) => x.type === t.ship);
       const live = s && s.shipments[t.ship];
       const cost = live && live.cost != null ? live.cost : def.cost;
-      const text = `Keeps ${min} ${t.item}. ${t.shipLabel} Shipments (${cost}) launch at ${min + cost}+.`;
+      const text = `${t.shipLabel} Shipments (${cost}) launch at ${min + cost}+ ${t.item}.`;
       el.dataset.tip = text;
     }
   }
