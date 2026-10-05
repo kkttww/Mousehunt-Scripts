@@ -662,7 +662,7 @@
       if (backedOff('raid')) return { status: 'Raid over, trap restore backing off' };
       return { status: 'Raid over, restoring trap', kind: 'raid', label: 'Restore trap', done: '', run: () => restoreAfterRaid() };
     }
-    const cleanup = shipCharmCleanup(s);
+    const cleanup = shipCharm.cleanupAction(s);
     if (cleanup) return cleanup;
 
     if (s.inFlight) {
@@ -670,10 +670,9 @@
       if (!cfg.autoBait) return { status: `${head} (bait swap off)` };
       const want = shipmentBait(s).forShipment(s.shipType);
       if (s.baitKey === want) {
-        if (shipLuckWanted(s) && rt.normalLuckKey !== flightLuckKey(s) && !backedOff('luck')) {
-          return { status: `${head}, checking luck`, kind: 'luck', label: 'Luck check (shipment)', run: () => normalLuckStep(s) };
-        }
-        return { status: `${head}, ${BAITS[want].label} armed${rt.luckNote ? ` · ${rt.luckNote}` : ''}` };
+        const luck = shipCharm.luckAction(s);
+        if (luck) return Object.assign({ status: `${head}, checking luck` }, luck);
+        return { status: `${head}, ${BAITS[want].label} armed${shipCharm.note ? ` · ${shipCharm.note}` : ''}` };
       }
       if (s[want] <= 0) {
         if (want === 'swiss' && cfg.autoCraft) {
@@ -1013,8 +1012,8 @@
         note: '',
       };
       raidStore.pending = null;
-      raidStore.shipCharm = raidStore.shipCharmPending = null;   // the raid manages (and later removes) the charm
       saveRaidStore();
+      shipCharm.raidStarted();
       return;
     }
 
@@ -1103,62 +1102,127 @@
     log(`✔ Trap restored${touched ? ', charm removed' : ''}`);
   }
 
-  function flightLuckKey(s) {
-    const u = window.user || {};
-    return `${s.shipType}|${u.weapon_name}|${u.base_name}|${u.bait_name}|${u.trinket_name || ''}`;
-  }
+  /* ------------------------------------------------------------------ *
+   * Ship charms: luck charms this script armed for a shipment
+   * ------------------------------------------------------------------ */
+  const SHIP_CHARM_KEY = 'mhCeruleanSkyport.shipCharm.v1';
 
-  // Shipment luck charms: 'always', or 'bocconcini' only while Aurora Bocconcini is the armed bait.
-  function shipLuckWanted(s) {
-    return cfg.luckCharmsNormal === 'always' || (cfg.luckCharmsNormal === 'bocconcini' && s.baitKey === 'bocconcini');
-  }
+  // Only a ship charm is ever swapped or removed on shipments; any other charm is yours. `charm` is the
+  // armed ship charm, `pending` the one being armed (an arm that times out but lands later is still ours).
+  // Seams: storage { load, save }, trap { trinket, setupKey, disarm }, luck { apply(onArm) -> note },
+  // plus config(), raidActive(), backedOff(kind) and log(msg).
+  function makeShipCharm({ storage, trap, luck, config, raidActive, backedOff, log }) {
+    const own = Object.assign({ charm: null, pending: null }, storage.load());
+    let note = '';         // last luck result, shown in the panel
+    let checkedKey = null; // shipment + trap setup the luck check last ran for
 
-  // Shipment charms this script armed: `shipCharm` once armed, `shipCharmPending` while arming (an arm that
-  // times out but lands later still counts as ours). Any other charm is yours and never touched.
-  const isOwnShipCharm = (name) => !!name && (name === raidStore.shipCharm || name === raidStore.shipCharmPending);
-
-  function forgetShipCharm() {
-    if (!raidStore.shipCharm && !raidStore.shipCharmPending) return;
-    raidStore.shipCharm = null;
-    raidStore.shipCharmPending = null;
-    saveRaidStore();
-  }
-
-  async function normalLuckStep(s) {
-    const armed = (window.user || {}).trinket_name || null;
-    if (armed && !isOwnShipCharm(armed)) {
-      forgetShipCharm();
-      rt.luckNote = `${armed} is yours, left alone`;
-      rt.normalLuckKey = flightLuckKey(s);
-      log(`Shipment luck: ${rt.luckNote}`);
-      return;
+    const owns = (name) => !!name && (name === own.charm || name === own.pending);
+    const save = () => storage.save({ charm: own.charm, pending: own.pending });
+    function release() {
+      if (!own.charm && !own.pending) return;
+      own.charm = own.pending = null;
+      save();
     }
-    const gear = await getGear(true);
-    const ml = await currentMinluck();
-    rt.luckNote = await applyLuckCharm(ml.value, gear, ml.source, (name) => { raidStore.shipCharmPending = name; saveRaidStore(); });
-    rt.normalLuckKey = flightLuckKey(s);
-    raidStore.shipCharm = (window.user || {}).trinket_name || null;
-    raidStore.shipCharmPending = null;
-    saveRaidStore();
-    log(`✔ Shipment luck: ${rt.luckNote}`);
+    const setupKey = (s) => `${s.shipType}|${trap.setupKey()}`;
+    // 'always', or 'bocconcini' only while Aurora Bocconcini is the armed bait.
+    const wanted = (s) => config().luckCharmsNormal === 'always'
+      || (config().luckCharmsNormal === 'bocconcini' && s.baitKey === 'bocconcini');
+
+    async function luckStep(s) {
+      const armed = trap.trinket();
+      if (armed && !owns(armed)) {
+        release();
+        note = `${armed} is yours, left alone`;
+        checkedKey = setupKey(s);
+        log(`Shipment luck: ${note}`);
+        return;
+      }
+      note = await luck.apply((name) => { own.pending = name; save(); });
+      checkedKey = setupKey(s);
+      own.charm = trap.trinket();
+      own.pending = null;
+      save();
+      log(`✔ Shipment luck: ${note}`);
+    }
+
+    return {
+      owns,
+      get note() { return note; },
+
+      // Every tick: shipment charms set to Off hands the charm over to you, however Off was set.
+      sync() {
+        if (config().luckCharmsNormal === 'off') release();
+      },
+
+      // A raid manages (and later removes) its own charm.
+      raidStarted: release,
+
+      // 'Only with Bocconcini': the ship charm comes off as soon as another bait is armed (Swiss after
+      // Bocconcini runs out, or the docked bait). Call before launch and raid decisions.
+      cleanupAction(s) {
+        if (!own.charm && !own.pending) return null;
+        if (config().luckCharmsNormal !== 'bocconcini' || s.isIntercepting || raidActive() || s.baitKey === 'bocconcini') return null;
+        const charm = trap.trinket();
+        if (!owns(charm)) { release(); return null; }
+        if (backedOff('luck')) return null;
+        const label = `Remove ${charm} (Bocconcini not armed)`;
+        return { status: label, kind: 'luck', label, run: async () => {
+          await trap.disarm();
+          release();
+          note = '';
+          checkedKey = null;
+        } };
+      },
+
+      // In flight with the right bait armed: a luck check when wanted and the setup changed since the last one.
+      luckAction(s) {
+        if (!wanted(s) || checkedKey === setupKey(s) || backedOff('luck')) return null;
+        return { kind: 'luck', label: 'Luck check (shipment)', run: () => luckStep(s) };
+      },
+    };
   }
 
-  // 'Only with Bocconcini': the charm this script armed for a shipment comes off as soon as another bait
-  // is armed (Swiss after Bocconcini runs out, or the docked bait). A charm you changed yourself is left alone.
-  function shipCharmCleanup(s) {
-    if (!raidStore.shipCharm && !raidStore.shipCharmPending) return null;
-    if (cfg.luckCharmsNormal !== 'bocconcini' || s.isIntercepting || raidStore.active || s.baitKey === 'bocconcini') return null;
-    const charm = (window.user || {}).trinket_name;
-    if (!isOwnShipCharm(charm)) { forgetShipCharm(); return null; }
-    if (backedOff('luck')) return null;
-    const label = `Remove ${charm} (Bocconcini not armed)`;
-    return { status: label, kind: 'luck', label, run: async () => {
-      await disarmCharm();
-      forgetShipCharm();
-      rt.luckNote = '';
-      rt.normalLuckKey = null;
-    } };
-  }
+  const shipCharm = makeShipCharm({
+    storage: {
+      load() {
+        try {
+          const d = JSON.parse(localStorage.getItem(SHIP_CHARM_KEY) || 'null');
+          if (d && typeof d === 'object') return d;
+        } catch (e) { /* corrupt or unavailable */ }
+        // One-time move out of the raid store (1.0.3 development builds kept it there).
+        const moved = { charm: raidStore.shipCharm || null, pending: raidStore.shipCharmPending || null };
+        if ('shipCharm' in raidStore || 'shipCharmPending' in raidStore) {
+          try { localStorage.setItem(SHIP_CHARM_KEY, JSON.stringify(moved)); } catch (e) { /* storage unavailable */ }
+          delete raidStore.shipCharm;
+          delete raidStore.shipCharmPending;
+          saveRaidStore();
+        }
+        return moved;
+      },
+      save(d) {
+        try { localStorage.setItem(SHIP_CHARM_KEY, JSON.stringify(d)); } catch (e) { /* storage unavailable */ }
+      },
+    },
+    trap: {
+      trinket: () => (window.user || {}).trinket_name || null,
+      setupKey: () => {
+        const u = window.user || {};
+        return `${u.weapon_name}|${u.base_name}|${u.bait_name}|${u.trinket_name || ''}`;
+      },
+      disarm: () => disarmCharm(),
+    },
+    luck: {
+      async apply(onArm) {
+        const gear = await getGear(true);
+        const ml = await currentMinluck();
+        return applyLuckCharm(ml.value, gear, ml.source, onArm);
+      },
+    },
+    config: () => cfg,
+    raidActive: () => !!raidStore.active,
+    backedOff: (kind) => backedOff(kind),
+    log: (msg) => log(msg),
+  });
 
   async function startRaid(raid) {
     // Remember the current weapon so it can be restored when the raid ends.
@@ -1434,6 +1498,7 @@
       const s = readState();
       if (!s) { rt.status = { kind: 'idle', lead: 'Not at Cerulean Skyport', detail: 'travel there to use the autopilot' }; return; }
       try { trackEvents(s, u); } catch (e) { console.warn(`[${SCRIPT}] events`, e); }
+      shipCharm.sync();
       if (u.has_puzzle) { rt.status = { kind: 'err', lead: "King's Reward", detail: 'paused until it is solved' }; return; }
 
       const wait = COOLDOWN_MS - (Date.now() - rt.lastAction);
@@ -1692,7 +1757,6 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
           cfg[key] = n;
           el.value = n;
         } else cfg[key] = el.value;
-        if (key === 'luckCharmsNormal' && cfg[key] === 'off') forgetShipCharm();   // Off: the charm is yours now
         showBaitMode();
         saveConfig();
         refreshTips(readState());
