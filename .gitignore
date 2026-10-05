@@ -4,3 +4,5 @@ docs/
 minluck-cre-tool.user.js
 prototype-*.html
 .claude/
+tests/
+CONTEXT.md

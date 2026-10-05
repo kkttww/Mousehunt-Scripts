@@ -501,20 +501,37 @@
   /* ------------------------------------------------------------------ *
    * Strategy
    * ------------------------------------------------------------------ */
-  const isBoccMode = () => cfg.spiceMode === 'bocconcini' || cfg.spiceMode === 'bocconcini_spice';
+  // Shipment bait options (cfg.spiceMode). `cheese`: the premium cheese (null = Swiss only); `spiceOnly`:
+  // only on Aurora Spice shipments; `useMin`: Min Bocconcini to keep applies. `hint` is shown in the panel.
+  const BAIT_MODES = {
+    swiss: { cheese: null, hint: 'Swiss on every shipment.' },
+    romano: { cheese: 'romano', hint: 'Romano on every shipment. Out of Romano: Swiss on every shipment.' },
+    bocconcini: { cheese: 'bocconcini', useMin: true,
+      hint: 'Bocconcini on every shipment. Out of Bocconcini (or at your minimum): Swiss on every shipment.' },
+    bocconcini_spice: { cheese: 'bocconcini', spiceOnly: true, useMin: true,
+      hint: 'Spice: Bocconcini · Cloudstone and Gas: Swiss. Out of Bocconcini (or at your minimum): Swiss on every shipment.' },
+  };
+  const baitMode = (c = cfg) => BAIT_MODES[c.spiceMode] || BAIT_MODES.swiss;
 
-  // Bocconcini on shipments only while above the Min to keep (0 = no minimum).
-  function boccAllowed(s) {
-    return s.bocconcini > Math.max(0, toNum(cfg.boccMin));
-  }
-
-  function flightBaitFor(shipType, s) {
-    // Romano on every shipment while you have any; Bocconcini on every (or only Spice) shipment while
-    // above the Min to keep; Swiss otherwise.
-    if (cfg.spiceMode === 'romano') return s.romano > 0 ? 'romano' : 'swiss';
-    if (cfg.spiceMode === 'bocconcini_spice' && shipType !== 'spice_shipment') return 'swiss';
-    if (isBoccMode() && boccAllowed(s)) return 'bocconcini';
-    return 'swiss';
+  // The shipment bait rule in one place: the premium cheese while you have it (above the minimum, where it
+  // applies), otherwise Swiss on every shipment. Returns the cheese per shipment type, why the premium
+  // cheese is not used (null | 'out' | 'min') and the matching log problems.
+  function shipmentBait(s, c = cfg) {
+    const mode = baitMode(c);
+    const cheese = mode.cheese;
+    const min = mode.useMin ? Math.max(0, toNum(c.boccMin)) : 0;
+    const fallback = !cheese ? null : s[cheese] <= 0 ? 'out' : s[cheese] <= min ? 'min' : null;
+    const problems = {};
+    if (fallback === 'out') {
+      problems[`out:${cheese}`] = [`⚠ Out of ${BAITS[cheese].label}, using Swiss on every shipment`, `✔ ${BAITS[cheese].label} back in stock`];
+    } else if (fallback === 'min') {
+      problems['bocc:min'] = [`⚠ Bocconcini at minimum (${min}), using Swiss on every shipment`, '✔ Bocconcini above minimum again'];
+    }
+    return {
+      forShipment: (type) => (cheese && !fallback && (!mode.spiceOnly || type === 'spice_shipment') ? cheese : 'swiss'),
+      fallback,
+      problems,
+    };
   }
 
   function shipmentCost(sh, s) {
@@ -651,7 +668,7 @@
     if (s.inFlight) {
       const head = `In flight: ${s.shipName || 'shipment'}, ${s.hunts} hunts left`;
       if (!cfg.autoBait) return { status: `${head} (bait swap off)` };
-      const want = flightBaitFor(s.shipType, s);
+      const want = shipmentBait(s).forShipment(s.shipType);
       if (s.baitKey === want) {
         if (shipLuckWanted(s) && rt.normalLuckKey !== flightLuckKey(s) && !backedOff('luck')) {
           return { status: `${head}, checking luck`, kind: 'luck', label: 'Luck check (shipment)', run: () => normalLuckStep(s) };
@@ -700,7 +717,7 @@
       } else if (!$1(SEL.hudShipButton(sh.type)) && !$1(SEL.shipDialog)) {
         note = `Ready for ${sh.label}, open Camp to launch`;
       } else {
-        const cheese = flightBaitFor(sh.type, s);
+        const cheese = shipmentBait(s).forShipment(sh.type);
         if (cheese === 'swiss' && s.swiss < MIN_SWISS) {
           if (cfg.autoCraft) {
             const c = craftDecision(s);
@@ -1339,16 +1356,7 @@
 
   // Each problem is logged once when it starts and (if it has a clear message) once when it clears.
   function problemsFor(s) {
-    const out = {};
-    const pick = isBoccMode() ? 'bocconcini' : cfg.spiceMode;
-    if ((pick === 'romano' || pick === 'bocconcini') && s[pick] <= 0) {
-      out[`out:${pick}`] = [`⚠ Out of ${BAITS[pick].label}, using Swiss on every shipment`, `✔ ${BAITS[pick].label} back in stock`];
-    } else if (pick === 'bocconcini') {
-      const min = toNum(cfg.boccMin);
-      if (min > 0 && s.bocconcini <= min) {
-        out['bocc:min'] = [`⚠ Bocconcini at minimum (${min}), using Swiss on every shipment`, '✔ Bocconcini above minimum again'];
-      }
-    }
+    const out = Object.assign({}, shipmentBait(s).problems);
     if (s.swiss <= 0) out['out:swiss'] = ['⚠ Out of Sky Pirate Swiss', '✔ Sky Pirate Swiss back in stock'];
     if (cfg.autoLaunch && !s.isShipping && !s.isIntercepting) {
       const { sh, allCapped } = pickShipment(s);
@@ -1516,13 +1524,6 @@
       `Starts a raid at ${INTEL_CAP} intel with ${RAID_MIN_BOCCONCINI}+ Bocconcini, using your luckiest weapon. Restores your trap after.`],
   ];
 
-  const BAIT_HINTS = {
-    swiss: 'Swiss on every shipment.',
-    romano: 'Romano on every shipment. Out of Romano: Swiss on every shipment.',
-    bocconcini: 'Bocconcini on every shipment. Out of Bocconcini (or at your minimum): Swiss on every shipment.',
-    bocconcini_spice: 'Spice: Bocconcini · Cloudstone and Gas: Swiss. Out of Bocconcini (or at your minimum): Swiss on every shipment.',
-  };
-
   const SETTING_TOGGLES = [
     ['luckCharmsRaid', 'Luck charms on raids',
       'If your luck is below minluck, arms the weakest charm that closes the gap (or your strongest). Removed after the raid.'],
@@ -1671,8 +1672,8 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
 
     // Spells out which cheese each shipment gets, including the fallback to Swiss.
     const showBaitMode = () => {
-      panel.classList.toggle('mhcs-show-bocc', isBoccMode());
-      panel.querySelector('[data-f="baitHint"]').textContent = BAIT_HINTS[cfg.spiceMode] || '';
+      panel.classList.toggle('mhcs-show-bocc', !!baitMode().useMin);
+      panel.querySelector('[data-f="baitHint"]').textContent = baitMode().hint;
     };
     const syncInputs = () => {
       for (const el of panel.querySelectorAll('[data-c]')) {
