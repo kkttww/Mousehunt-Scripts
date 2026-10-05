@@ -658,9 +658,9 @@
       return r.run || !fuel ? r : fuel;   // weapon / charm / bait setup first, then cannonballs
     }
     if (fuel) return fuel;
-    if (raidStore.active) {
+    if (raids.isActive()) {
       if (backedOff('raid')) return { status: 'Raid over, trap restore backing off' };
-      return { status: 'Raid over, restoring trap', kind: 'raid', label: 'Restore trap', done: '', run: () => restoreAfterRaid() };
+      return { status: 'Raid over, restoring trap', kind: 'raid', label: 'Restore trap', done: '', run: () => raids.restore() };
     }
     const cleanup = shipCharm.cleanupAction(s);
     if (cleanup) return cleanup;
@@ -940,16 +940,40 @@
     return values;
   }
 
-  // Minluck for the currently armed power type: built-in table → Minluck tool → FALLBACK_LUCK.
-  async function currentMinluck() {
-    const pt = (window.user || {}).trap_power_type_name;
-    const b = await builtinMinluck([pt]);
-    if (b && isFinite(b[pt])) return { value: b[pt], source: 'table' };
-    if ($1(SEL.minluckButton)) {
-      try { return { value: await readMinluck(), source: 'tool' }; } catch (e) { log(`Minluck tool: ${e.message}`, 'error'); }
-    }
-    return { value: FALLBACK_LUCK, source: 'fallback' };
+  // Minluck source order, in one place: built-in table → Minluck tool → `fallback` (FALLBACK_LUCK).
+  // Seams: table(powerTypes) -> { [powerType]: minluck } | null, toolAvailable(), readTool(), log(msg, level).
+  function makeMinluck({ table, toolAvailable, readTool, fallback, log }) {
+    return {
+      fallback,
+      readTool,
+
+      // The armed power type: { value, source: 'table' | 'tool' | 'fallback' }.
+      async current(powerType) {
+        const t = await table([powerType]);
+        if (t && isFinite(t[powerType])) return { value: t[powerType], source: 'table' };
+        if (toolAvailable()) {
+          try { return { value: await readTool(), source: 'tool' }; } catch (e) { log(`Minluck tool: ${e.message}`, 'error'); }
+        }
+        return { value: fallback, source: 'fallback' };
+      },
+
+      // Several power types at once (raid weapon choice): the table answers all of them ({ source: 'table',
+      // values }), else 'tool' (each weapon is armed and measured) or 'fallback'.
+      async forTypes(powerTypes) {
+        const values = await table(powerTypes);
+        if (values) return { source: 'table', values };
+        return { source: toolAvailable() ? 'tool' : 'fallback', values: null };
+      },
+    };
   }
+
+  const minluck = makeMinluck({
+    table: (powerTypes) => builtinMinluck(powerTypes),
+    toolAvailable: () => !!$1(SEL.minluckButton),
+    readTool: () => readMinluck(),
+    fallback: FALLBACK_LUCK,
+    log: (msg, level) => log(msg, level),
+  });
 
   // Charm choice for the current setup; returns a short note for the panel.
   async function applyLuckCharm(minluck, gear, source, onArm) {
@@ -973,10 +997,8 @@
   function raidDecision(s) {
     const r = s.raid;
     const head = `Raid: ${r.name}, ${r.hunts} hunts left`;
-    const a = raidStore.active;
-    if (!a || a.name !== r.name) {
-      return { status: `${head}, setting up`, kind: 'raid', label: `Raid setup (${r.name})`, run: () => raidStep(s) };
-    }
+    const init = raids.initAction(s);
+    if (init) return Object.assign({ status: `${head}, setting up` }, init);
     if (cfg.autoBait && s.baitKey !== 'bocconcini') {
       if (s.bocconcini > 0) return { status: `${head}, arming Bocconcini`, kind: 'bait', label: 'Arm Aurora Bocconcini (raid)', run: () => armBait('bocconcini') };
       if (cfg.autoCraft) {
@@ -986,24 +1008,24 @@
       }
       return { status: `${head}, out of Bocconcini` };
     }
-    const u = window.user || {};
-    const charmGone = a.charmName && u.trinket_name !== a.charmName;
-    const weaponChanged = a.weaponName && u.weapon_name !== a.weaponName;
-    if ((a.phase !== 'done' || charmGone || weaponChanged) && !backedOff('raid')) {
-      if (a.phase === 'done' && (charmGone || weaponChanged)) { a.phase = 'charm'; saveRaidStore(); }
-      return { status: `${head}, ${a.phase === 'weapon' ? 'choosing weapon' : 'choosing charm'}`, kind: 'raid', label: `Raid ${a.phase} (${r.name})`, run: () => raidStep(s) };
-    }
-    return { status: `${head}${a.note ? ` · ${a.note}` : ''}` };
+    const step = raids.stepAction(s);
+    if (step) return Object.assign({ status: `${head}, ${step.doing}` }, step);
+    return { status: `${head}${raids.note ? ` · ${raids.note}` : ''}` };
   }
 
-  // One step of raid setup per call: init → weapon (measure power types) → charm → done.
-  async function raidStep(s) {
-    const r = s.raid;
-    const u = window.user || {};
-    let a = raidStore.active;
-    if (!a || a.name !== r.name) {
-      const pending = raidStore.pending && raidStore.pending.name === r.name ? raidStore.pending : null;
-      a = raidStore.active = {
+  // One raid at a time: pending (remembered when it starts) → weapon → charm → done, then restore after it.
+  // The stored record also caches Minluck tool readings per raid and power type.
+  // Seams: storage { load, save }, gear { list(), armed(gear) }, trap { weapon(), trinket(), powerType(),
+  // arm(type, classification, name), disarmCharm() }, minluck (makeMinluck), luck { apply(minluck, gear, source) -> note },
+  // plus config(), charmMin(), backedOff(kind), log(msg) and onStart() (the raid takes over the charm).
+  function makeRaid({ storage, gear, trap, minluck, luck, config, charmMin, backedOff, log, onStart }) {
+    const store = storage.load();
+    const save = () => storage.save();
+    const activeFor = (name) => (store.active && store.active.name === name ? store.active : null);
+
+    function init(r) {
+      const pending = store.pending && store.pending.name === r.name ? store.pending : null;
+      store.active = {
         name: r.name,
         prevWeapon: pending ? pending.prevWeapon : null,
         phase: 'weapon',
@@ -1011,96 +1033,150 @@
         charmName: null,
         note: '',
       };
-      raidStore.pending = null;
-      saveRaidStore();
-      shipCharm.raidStarted();
-      return;
+      store.pending = null;
+      save();
+      onStart();
     }
 
-    const gear = await getGear(true);
-    if (a.phase === 'weapon') {
-      const allowed = r.powerTypes.length ? r.powerTypes : [u.trap_power_type_name];
+    // Highest-luck weapon among the allowed power types that can reach minluck (with the best charm).
+    async function weaponStep(r, a) {
+      const g = await gear.list();
+      const allowed = r.powerTypes.length ? r.powerTypes : [trap.powerType()];
       // Best (highest-luck) weapon per allowed type, types ordered by that luck.
-      const best = allowed.map((pt) => gear.weapons.filter((w) => w.powerType === pt).sort((x, y) => y.luck - x.luck || y.power - x.power)[0])
+      const best = allowed.map((pt) => g.weapons.filter((w) => w.powerType === pt).sort((x, y) => y.luck - x.luck || y.power - x.power)[0])
         .filter(Boolean).sort((x, y) => y.luck - x.luck);
       if (!best.length) throw new Error(`no weapon of type ${allowed.join('/')}`);
-      const topCharm = cfg.luckCharmsRaid ? Math.max(0, ...gear.charms.filter((c) => c.qty > charmMin()).map((c) => c.luck)) : 0;
-      const cur = armedGear(gear);
+      const topCharm = config().luckCharmsRaid ? Math.max(0, ...g.charms.filter((c) => c.qty > charmMin()).map((c) => c.luck)) : 0;
+      const cur = gear.armed(g);
       const baseLuck = cur.luck - (cur.weapon ? cur.weapon.luck : 0) - (cur.charm ? cur.charm.luck : 0);
 
-      // Minluck per allowed type: built-in table (no arming needed), else measure each type with the
-      // Minluck tool, else aim for FALLBACK_LUCK.
-      const table = await builtinMinluck(best.map((w) => w.powerType));
-      const toolOk = !table && !!$1(SEL.minluckButton);
-      a.source = table ? 'table' : toolOk ? 'tool' : 'fallback';
+      // Minluck per allowed type: the table (no arming needed), else measure each type with the Minluck
+      // tool (cached), else aim for the fallback.
+      const ml = await minluck.forTypes(best.map((w) => w.powerType));
+      a.source = ml.source;
+      const known = (w) => {
+        if (ml.source === 'table') return ml.values[w.powerType];
+        if (ml.source === 'fallback') return minluck.fallback;
+        const v = store.minluck[`${r.name}|${w.powerType}`];
+        return v === 'inf' ? Infinity : v;
+      };
       let chosen = null;
       for (const w of best) {
-        const key = `${r.name}|${w.powerType}`;
-        let ml;
-        if (table) {
-          ml = table[w.powerType];
-        } else if (toolOk) {
-          ml = raidStore.minluck[key];
-          if (ml == null) {
-            if (u.weapon_name !== w.name) { await armGear(w.type, 'weapon', w.name); return; } // measure next tick
-            ml = await readMinluck();
-            raidStore.minluck[key] = ml === Infinity ? 'inf' : ml;
-            saveRaidStore();
-          }
-          if (ml === 'inf') ml = Infinity;
-        } else {
-          ml = FALLBACK_LUCK;
+        let v = known(w);
+        if (v == null) {
+          if (trap.weapon() !== w.name) { await trap.arm(w.type, 'weapon', w.name); return; } // measure next tick
+          v = await minluck.readTool();
+          store.minluck[`${r.name}|${w.powerType}`] = v === Infinity ? 'inf' : v;
+          save();
         }
-        if (baseLuck + w.luck + topCharm >= ml) { chosen = w; a.minluck = ml; break; }
+        if (baseLuck + w.luck + topCharm >= v) { chosen = w; a.minluck = v; break; }
       }
       if (!chosen) {
         chosen = best[0];
-        a.minluck = table ? table[chosen.powerType] : toolOk ? raidStore.minluck[`${r.name}|${chosen.powerType}`] : FALLBACK_LUCK;
-        if (a.minluck === 'inf') a.minluck = Infinity;
+        a.minluck = known(chosen);
       }
-      if (u.weapon_name !== chosen.name) await armGear(chosen.type, 'weapon', chosen.name);
+      if (trap.weapon() !== chosen.name) await trap.arm(chosen.type, 'weapon', chosen.name);
       a.weaponName = chosen.name;
       a.powerType = chosen.powerType;
       a.phase = 'charm';
-      saveRaidStore();
+      save();
       log(`✔ Raid weapon: ${chosen.name}`);
-      return;
     }
 
-    if (a.phase === 'charm') {
-      if (!cfg.luckCharmsRaid) {
+    async function charmStep(a) {
+      if (!config().luckCharmsRaid) {
         a.note = 'luck charms off for raids';
         a.charmTouched = false;
         a.charmName = null;
         a.phase = 'done';
-        saveRaidStore();
+        save();
         return;
       }
       a.charmTouched = true;
       // Re-resolve for the armed weapon (charm changes don't alter minluck).
-      const cur = await currentMinluck();
-      const ml = cur.source === 'fallback' && a.minluck != null && a.source !== 'fallback' ? a.minluck : cur.value;
-      a.note = await applyLuckCharm(ml, await getGear(true), cur.source === 'fallback' && a.source !== 'fallback' ? a.source : cur.source);
-      a.charmName = (window.user || {}).trinket_name || null;
+      const cur = await minluck.current(trap.powerType());
+      const keep = cur.source === 'fallback' && a.minluck != null && a.source !== 'fallback';
+      a.note = await luck.apply(keep ? a.minluck : cur.value, await gear.list(), keep ? a.source : cur.source);
+      a.charmName = trap.trinket();
       a.phase = 'done';
-      saveRaidStore();
+      save();
       log(`✔ Raid luck: ${a.note}`);
     }
+
+    // After a raid: previous weapon back, charm off (left alone if raids didn't use charms).
+    async function restore() {
+      const a = store.active;
+      if (a && a.prevWeapon && trap.weapon() !== a.prevWeapon.name) {
+        await trap.arm(a.prevWeapon.type, 'weapon', a.prevWeapon.name);
+        return;
+      }
+      const touched = !a || a.charmTouched !== false;
+      if (touched) await trap.disarmCharm();
+      store.active = null;
+      save();
+      log(`✔ Trap restored${touched ? ', charm removed' : ''}`);
+    }
+
+    return {
+      get store() { return store; },
+      get note() { return store.active ? store.active.note || '' : ''; },
+      isActive: () => !!store.active,
+
+      // Remember the weapon to restore; called just before the raid dialog is used.
+      starting(name, prevWeapon) {
+        store.pending = { name, prevWeapon };
+        save();
+      },
+
+      // Every tick: a finished setup re-checks the charm when you change the charm or weapon mid-raid.
+      sync(s) {
+        const a = s.isIntercepting && activeFor(s.raid.name);
+        if (!a || a.phase !== 'done') return;
+        const charmGone = a.charmName && trap.trinket() !== a.charmName;
+        const weaponChanged = a.weaponName && trap.weapon() !== a.weaponName;
+        if (charmGone || weaponChanged) { a.phase = 'charm'; save(); }
+      },
+
+      // Intercepting a raid this module isn't tracking yet.
+      initAction(s) {
+        if (activeFor(s.raid.name)) return null;
+        return { kind: 'raid', label: `Raid setup (${s.raid.name})`, run: async () => init(s.raid) };
+      },
+
+      // The next setup step (weapon or charm) while the setup isn't done.
+      stepAction(s) {
+        const a = activeFor(s.raid.name);
+        if (!a || a.phase === 'done' || backedOff('raid')) return null;
+        return {
+          kind: 'raid',
+          label: `Raid ${a.phase} (${s.raid.name})`,
+          doing: a.phase === 'weapon' ? 'choosing weapon' : 'choosing charm',
+          run: () => (a.phase === 'weapon' ? weaponStep(s.raid, a) : charmStep(a)),
+        };
+      },
+
+      restore,
+    };
   }
 
-  // After a raid: previous weapon back, charm off.
-  async function restoreAfterRaid() {
-    const a = raidStore.active;
-    if (a && a.prevWeapon && (window.user || {}).weapon_name !== a.prevWeapon.name) {
-      await armGear(a.prevWeapon.type, 'weapon', a.prevWeapon.name);
-      return;
-    }
-    const touched = !a || a.charmTouched !== false;   // leave your own charm alone if raids didn't use charms
-    if (touched) await disarmCharm();
-    raidStore.active = null;
-    saveRaidStore();
-    log(`✔ Trap restored${touched ? ', charm removed' : ''}`);
-  }
+  const raids = makeRaid({
+    storage: { load: () => raidStore, save: () => saveRaidStore() },
+    gear: { list: () => getGear(true), armed: (g) => armedGear(g) },
+    trap: {
+      weapon: () => (window.user || {}).weapon_name,
+      trinket: () => (window.user || {}).trinket_name || null,
+      powerType: () => (window.user || {}).trap_power_type_name,
+      arm: (type, classification, name) => armGear(type, classification, name),
+      disarmCharm: () => disarmCharm(),
+    },
+    minluck,
+    luck: { apply: (ml, g, source) => applyLuckCharm(ml, g, source) },
+    config: () => cfg,
+    charmMin: () => charmMin(),
+    backedOff: (kind) => backedOff(kind),
+    log: (msg) => log(msg),
+    onStart: () => shipCharm.raidStarted(),
+  });
 
   /* ------------------------------------------------------------------ *
    * Ship charms: luck charms this script armed for a shipment
@@ -1214,12 +1290,12 @@
     luck: {
       async apply(onArm) {
         const gear = await getGear(true);
-        const ml = await currentMinluck();
+        const ml = await minluck.current((window.user || {}).trap_power_type_name);
         return applyLuckCharm(ml.value, gear, ml.source, onArm);
       },
     },
     config: () => cfg,
-    raidActive: () => !!raidStore.active,
+    raidActive: () => raids.isActive(),
     backedOff: (kind) => backedOff(kind),
     log: (msg) => log(msg),
   });
@@ -1228,8 +1304,7 @@
     // Remember the current weapon so it can be restored when the raid ends.
     const gear = await getGear(true);
     const cur = armedGear(gear);
-    raidStore.pending = { name: raid.name, prevWeapon: cur.weapon ? { type: cur.weapon.type, name: cur.weapon.name } : null };
-    saveRaidStore();
+    raids.starting(raid.name, cur.weapon ? { type: cur.weapon.type, name: cur.weapon.name } : null);
 
     let view = $1(SEL.raidDialog);
     if (!view) {
@@ -1472,7 +1547,7 @@
     if (plan.run) return { kind: 'work', lead: 'Working', detail: plan.label };
     let kind = 'idle';
     let lead = 'Docked';
-    if (s.isIntercepting || raidStore.active) { kind = 'work'; lead = 'Raid'; }
+    if (s.isIntercepting || raids.isActive()) { kind = 'work'; lead = 'Raid'; }
     else if (s.inFlight) { kind = 'ok'; lead = 'In flight'; }
     const detail = String(plan.status)
       .replace(/^In flight: /, '')
@@ -1499,6 +1574,7 @@
       if (!s) { rt.status = { kind: 'idle', lead: 'Not at Cerulean Skyport', detail: 'travel there to use the autopilot' }; return; }
       try { trackEvents(s, u); } catch (e) { console.warn(`[${SCRIPT}] events`, e); }
       shipCharm.sync();
+      raids.sync(s);
       if (u.has_puzzle) { rt.status = { kind: 'err', lead: "King's Reward", detail: 'paused until it is solved' }; return; }
 
       const wait = COOLDOWN_MS - (Date.now() - rt.lastAction);
@@ -1864,7 +1940,7 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
     scheduleTick(2000);
 
     // Console handle: mhSkyport.state(), mhSkyport.tick(). busy() is read by the Auto Horn script.
-    window.mhSkyport = { state: readState, tick: () => scheduleTick(0), busy: () => rt.busy, config: cfg, raid: () => raidStore, readMinluck, currentMinluck, builtinMinluck };
+    window.mhSkyport = { state: readState, tick: () => scheduleTick(0), busy: () => rt.busy, config: cfg, raid: () => raids.store, readMinluck, currentMinluck: () => minluck.current((window.user || {}).trap_power_type_name), builtinMinluck };
     console.log(`[${SCRIPT}] Loaded`);
   }
 
