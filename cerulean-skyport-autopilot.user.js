@@ -279,7 +279,7 @@
     minCloudstone: 120,
     autoRaid: true,           // start raids when intel >= 50 and Bocconcini >= 25
     craftEssence: true,       // craft with Magic Essence (Gold as fallback); off = Gold recipes only
-    autoWeapon: true,         // C.L.A.W. Machine with standard cheese, luckiest Law weapon on shipments (not raids)
+    autoTrap: true,           // Auto Trap: the weapon for every stage (C.L.A.W. for curds, Law on shipments, raid types)
     luckCharmsRaid: true,     // pick luck charms during raids
     luckCharmsNormal: 'bocconcini', // luck charms during shipments: 'off' | 'bocconcini' (only while Bocconcini is armed) | 'always'
     charmMinQty: CHARM_MIN_QTY, // only luck charms held in quantities above this are used
@@ -298,7 +298,10 @@
   function loadConfig() {
     try {
       const raw = localStorage.getItem(STORE_KEY);
-      const c = Object.assign({}, DEFAULTS, raw ? JSON.parse(raw) : {});
+      const saved = raw ? JSON.parse(raw) : {};
+      if ('autoWeapon' in saved && !('autoTrap' in saved)) saved.autoTrap = saved.autoWeapon;   // 1.0.3 test builds
+      delete saved.autoWeapon;
+      const c = Object.assign({}, DEFAULTS, saved);
       if (typeof c.luckCharmsNormal === 'boolean') c.luckCharmsNormal = c.luckCharmsNormal ? 'always' : 'off';
       return c;
     } catch (e) {
@@ -795,9 +798,9 @@
     return docked(s.bait.armed ? 'bait idle' : 'disarmed');
   }
 
-  // Intercepting a raid: raid setup (raids module) around arming / crafting Bocconcini, then the status.
+  // Intercepting a raid: raid setup, Bocconcini (armed or crafted), the weapon (Auto Trap), the raid charm.
   function raidDecision(s, ctx) {
-    const { cfg, raids } = ctx;
+    const { cfg, raids, weapon } = ctx;
     const r = s.raid;
     const head = `${r.name}, ${r.hunts} hunts left`;
     const init = raids.initAction(s);
@@ -811,6 +814,8 @@
       }
       return decision('Raid', `${head}, out of Bocconcini`);
     }
+    const wpn = weapon.action(s);
+    if (wpn) return doing('Raid', wpn);
     const step = raids.stepAction(s);
     if (step) return doing('Raid', step);
     return decision('Raid', `${head}${raids.note ? ` · ${raids.note}` : ''}`);
@@ -1054,77 +1059,26 @@
     return `${pick.charm.name} +${pick.charm.luck} → luck ${luckNoCharm + pick.charm.luck}/${minluck}${pick.enough ? '' : ' (not guaranteed)'}${src}`;
   }
 
-  // One raid at a time: pending (remembered when it starts) → weapon → charm → done, then restore after it.
-  // The stored record also caches Minluck tool readings per raid and power type.
-  // Seams: storage { load, save }, gear { list(), armed(gear) }, trap { weapon(), trinket(), powerType(),
-  // arm(type, classification, name), disarmCharm() }, minluck (makeMinluck), luck { apply(minluck, gear, source) -> note },
-  // plus config(), charmMin(), backedOff(kind), log(msg) and onStart() (the raid takes over the charm).
-  function makeRaid({ storage, gear, trap, minluck, luck, config, charmMin, backedOff, log, onStart }) {
+  // One raid at a time: setup (the raid's luck charm, after Auto Trap has picked the weapon) → done, and the
+  // charm comes off after the raid. The stored record also caches Minluck tool readings per raid and power type.
+  // Seams: storage { load, save }, gear { list() }, trap { weapon(), trinket(), powerType(), disarmCharm() },
+  // minluck (makeMinluck), luck { apply(minluck, gear, source) -> note }, plus config(), backedOff(kind), log(msg)
+  // and onStart() (the raid takes over the charm).
+  function makeRaid({ storage, gear, trap, minluck, luck, config, backedOff, log, onStart }) {
     const store = storage.load();
+    if (store.active && store.active.phase === 'weapon') store.active.phase = 'charm';   // older builds picked the weapon here
+    delete store.pending;
     const save = () => storage.save();
     const activeFor = (name) => (store.active && store.active.name === name ? store.active : null);
 
     function init(r) {
-      const pending = store.pending && store.pending.name === r.name ? store.pending : null;
-      store.active = {
-        name: r.name,
-        prevWeapon: pending ? pending.prevWeapon : null,
-        phase: 'weapon',
-        weaponName: null,
-        charmName: null,
-        note: '',
-      };
-      store.pending = null;
+      store.active = { name: r.name, phase: 'charm', weaponName: null, charmName: null, note: '' };
       save();
       onStart();
     }
 
-    // Highest-luck weapon among the allowed power types that can reach minluck (with the best charm).
-    async function weaponStep(r, a) {
-      const g = await gear.list();
-      const allowed = r.powerTypes.length ? r.powerTypes : [trap.powerType()];
-      // Best (highest-luck) weapon per allowed type, types ordered by that luck.
-      const best = allowed.map((pt) => g.weapons.filter((w) => w.powerType === pt).sort((x, y) => y.luck - x.luck || y.power - x.power)[0])
-        .filter(Boolean).sort((x, y) => y.luck - x.luck);
-      if (!best.length) throw new Error(`no weapon of type ${allowed.join('/')}`);
-      const topCharm = config().luckCharmsRaid ? Math.max(0, ...g.charms.filter((c) => c.qty > charmMin()).map((c) => c.luck)) : 0;
-      const cur = gear.armed(g);
-      const baseLuck = cur.luck - (cur.weapon ? cur.weapon.luck : 0) - (cur.charm ? cur.charm.luck : 0);
-
-      // Minluck per allowed type: the table (no arming needed), else measure each type with the Minluck
-      // tool (cached), else aim for the fallback.
-      const ml = await minluck.forTypes(best.map((w) => w.powerType));
-      a.source = ml.source;
-      const known = (w) => {
-        if (ml.source === 'table') return ml.values[w.powerType];
-        if (ml.source === 'fallback') return minluck.fallback;
-        const v = store.minluck[`${r.name}|${w.powerType}`];
-        return v === 'inf' ? Infinity : v;
-      };
-      let chosen = null;
-      for (const w of best) {
-        let v = known(w);
-        if (v == null) {
-          if (trap.weapon() !== w.name) { await trap.arm(w.type, 'weapon', w.name); return; } // measure next tick
-          v = await minluck.readTool();
-          store.minluck[`${r.name}|${w.powerType}`] = v === Infinity ? 'inf' : v;
-          save();
-        }
-        if (baseLuck + w.luck + topCharm >= v) { chosen = w; a.minluck = v; break; }
-      }
-      if (!chosen) {
-        chosen = best[0];
-        a.minluck = known(chosen);
-      }
-      if (trap.weapon() !== chosen.name) await trap.arm(chosen.type, 'weapon', chosen.name);
-      a.weaponName = chosen.name;
-      a.powerType = chosen.powerType;
-      a.phase = 'charm';
-      save();
-      log(`✔ Raid weapon: ${chosen.name}`);
-    }
-
-    async function charmStep(a) {
+    async function charmStep(r, a) {
+      a.weaponName = trap.weapon();
       if (!config().luckCharmsRaid) {
         a.note = 'luck charms off for raids';
         a.charmTouched = false;
@@ -1134,40 +1088,32 @@
         return;
       }
       a.charmTouched = true;
-      // Re-resolve for the armed weapon (charm changes don't alter minluck).
-      const cur = await minluck.current(trap.powerType());
-      const keep = cur.source === 'fallback' && a.minluck != null && a.source !== 'fallback';
-      a.note = await luck.apply(keep ? a.minluck : cur.value, await gear.list(), keep ? a.source : cur.source);
+      // Minluck for the armed weapon's type; if the lookup falls back, an earlier Minluck tool reading for it.
+      const pt = trap.powerType();
+      const cur = await minluck.current(pt);
+      const cached = cur.source === 'fallback' ? store.minluck[`${r.name}|${pt}`] : null;
+      const ml = cached != null ? { value: cached === 'inf' ? Infinity : cached, source: 'tool' } : cur;
+      a.note = await luck.apply(ml.value, await gear.list(), ml.source);
       a.charmName = trap.trinket();
       a.phase = 'done';
       save();
       log(`✔ Raid luck: ${a.note}`);
     }
 
-    // After a raid: previous weapon back, charm off (left alone if raids didn't use charms).
+    // After a raid: the raid's charm off (left alone if raids didn't use charms). Auto Trap picks the weapon.
     async function restore() {
       const a = store.active;
-      if (a && a.prevWeapon && trap.weapon() !== a.prevWeapon.name) {
-        await trap.arm(a.prevWeapon.type, 'weapon', a.prevWeapon.name);
-        return;
-      }
       const touched = !a || a.charmTouched !== false;
       if (touched) await trap.disarmCharm();
       store.active = null;
       save();
-      log(`✔ Trap restored${touched ? ', charm removed' : ''}`);
+      log(`✔ Raid over${touched ? ', charm removed' : ''}`);
     }
 
     return {
       get store() { return store; },
       get note() { return store.active ? store.active.note || '' : ''; },
       isActive: () => !!store.active,
-
-      // Remember the weapon to restore; called just before the raid dialog is used.
-      starting(name, prevWeapon) {
-        store.pending = { name, prevWeapon };
-        save();
-      },
 
       // Every tick: a finished setup re-checks the charm when you change the charm or weapon mid-raid.
       sync(s) {
@@ -1184,16 +1130,11 @@
         return { kind: 'raid', label: `Raid setup (${s.raid.name})`, run: async () => init(s.raid) };
       },
 
-      // The next setup step (weapon or charm) while the setup isn't done.
+      // The charm step while the setup isn't done.
       stepAction(s) {
         const a = activeFor(s.raid.name);
         if (!a || a.phase === 'done' || backedOff('raid')) return null;
-        return {
-          kind: 'raid',
-          label: `Raid ${a.phase} (${s.raid.name})`,
-          doing: a.phase === 'weapon' ? 'choosing weapon' : 'choosing charm',
-          run: () => (a.phase === 'weapon' ? weaponStep(s.raid, a) : charmStep(a)),
-        };
+        return { kind: 'raid', label: `Raid charm (${s.raid.name})`, run: () => charmStep(s.raid, a) };
       },
 
       restore,
@@ -1202,18 +1143,16 @@
 
   const raids = makeRaid({
     storage: { load: () => raidStore, save: () => saveRaidStore() },
-    gear: { list: () => getGear(true), armed: (g) => armedGear(g) },
+    gear: { list: () => getGear(true) },
     trap: {
       weapon: () => (window.user || {}).weapon_name,
       trinket: () => (window.user || {}).trinket_name || null,
       powerType: () => (window.user || {}).trap_power_type_name,
-      arm: (type, classification, name) => armGear(type, classification, name),
       disarmCharm: () => disarmCharm(),
     },
     minluck,
     luck: { apply: (ml, g, source) => applyLuckCharm(ml, g, source) },
     config: () => cfg,
-    charmMin: () => charmMin(),
     backedOff: (kind) => backedOff(kind),
     log: (msg) => log(msg),
     onStart: () => shipCharm.raidStarted(),
@@ -1342,26 +1281,31 @@
   });
 
   /* ------------------------------------------------------------------ *
-   * Auto weapon: C.L.A.W. Machine for curds, else the luckiest Law weapon
+   * Auto Trap: the weapon for every stage
    * ------------------------------------------------------------------ */
-  // Outside raids (the raid module picks raid weapons). Role 'claw' while Gouda or SUPER|brie+ is armed: the
-  // C.L.A.W. Machine doubles Corsair's Curds, which those mice drop on every catch (without one, the luckiest
-  // Law weapon). Role 'law' while Swiss, Romano or Bocconcini is armed: Skyport shipment mice are all Law.
-  // Seams: gear { list() }, trap { weapon(), arm(type, classification, name) }, config(), backedOff(kind), log(msg).
-  function makeWeapon({ gear, trap, config, backedOff, log }) {
+  // Role 'claw' while Gouda or SUPER|brie+ is armed: the C.L.A.W. Machine doubles Corsair's Curds, which those
+  // mice drop on every catch (without one, the luckiest Law weapon). Role 'law' while Swiss, Romano or Bocconcini
+  // is armed: Skyport shipment mice are all Law. Role 'raid' while intercepting: the raid location's allowed
+  // power types, the luckiest weapon that reaches minluck with the best raid charm (else the luckiest).
+  // Seams: gear { list(), armed(gear) }, trap { weapon(), powerType(), arm(type, classification, name) },
+  // minluck (makeMinluck), cache { get(key), set(key, minluck) } for Minluck tool readings per raid and type,
+  // plus config(), charmMin(), backedOff(kind), log(msg).
+  function makeWeapon({ gear, trap, minluck, cache, config, charmMin, backedOff, log }) {
     const STANDARD = ['gouda', 'superbrie'];
     const PREMIUM = ['swiss', 'romano', 'bocconcini'];
-    let checkedKey = null;   // role + weapon the last check ran for
-    let noLawLogged = false;
+    const LABELS = { claw: 'Weapon check (curds)', law: 'Weapon check (shipment)', raid: 'Weapon check (raid)' };
+    let checkedKey = null;     // role (+ raid) and weapon the last check ran for
+    const warned = new Set();  // "no weapon" lines, logged once each
 
     function role(s) {
-      if (!config().autoWeapon || s.isIntercepting) return null;
+      if (!config().autoTrap) return null;
+      if (s.isIntercepting) return s.raid ? 'raid' : null;
       if (STANDARD.includes(s.baitKey)) return 'claw';
       if (PREMIUM.includes(s.baitKey)) return 'law';
       return null;
     }
 
-    // The weapon for a role, from the owned weapons: { weapon, reason } or null (no Law weapon).
+    // Docked / shipments: { weapon, reason } or null (no Law weapon).
     function pick(weapons, r) {
       const claw = r === 'claw' && weapons.find((w) => /C\.L\.A\.W\./i.test(w.name));
       if (claw) return { weapon: claw, reason: "doubles Corsair's Curds" };
@@ -1370,49 +1314,85 @@
       return { weapon: law, reason: r === 'claw' ? 'no C.L.A.W. Machine, luckiest Law weapon' : 'luckiest Law weapon' };
     }
 
-    const key = (r) => `${r}|${trap.weapon()}`;
+    // Raids: { weapon, reason }, { measure: weapon } (arm it, read the Minluck tool next tick) or { none: types }.
+    async function pickRaid(raid, g) {
+      const allowed = raid.powerTypes.length ? raid.powerTypes : [trap.powerType()];
+      // Best (highest-luck) weapon per allowed type, types ordered by that luck.
+      const best = allowed.map((pt) => g.weapons.filter((w) => w.powerType === pt).sort((x, y) => y.luck - x.luck || y.power - x.power)[0])
+        .filter(Boolean).sort((x, y) => y.luck - x.luck);
+      if (!best.length) return { none: allowed.join('/') };
+      const topCharm = config().luckCharmsRaid ? Math.max(0, ...g.charms.filter((c) => c.qty > charmMin()).map((c) => c.luck)) : 0;
+      const cur = gear.armed(g);
+      const baseLuck = cur.luck - (cur.weapon ? cur.weapon.luck : 0) - (cur.charm ? cur.charm.luck : 0);
+      const ml = await minluck.forTypes(best.map((w) => w.powerType));
+      const known = (w) => {
+        if (ml.source === 'table') return ml.values[w.powerType];
+        if (ml.source === 'fallback') return minluck.fallback;
+        return cache.get(`${raid.name}|${w.powerType}`);
+      };
+      for (const w of best) {
+        let v = known(w);
+        if (v == null) {
+          if (trap.weapon() !== w.name) return { measure: w };
+          v = await minluck.readTool();
+          cache.set(`${raid.name}|${w.powerType}`, v);
+        }
+        if (baseLuck + w.luck + topCharm >= v) return { weapon: w, reason: `${w.powerType} raid, reaches minluck ${v}` };
+      }
+      return { weapon: best[0], reason: `${best[0].powerType} raid, luckiest (minluck out of reach)` };
+    }
 
-    async function check(r) {
-      const p = pick((await gear.list()).weapons, r);
-      if (!p) {
-        if (!noLawLogged) log('Auto weapon: no Law weapon owned, weapon left alone');
-        noLawLogged = true;
+    const key = (r, s) => `${r === 'raid' ? `raid:${s.raid.name}` : r}|${trap.weapon()}`;
+
+    async function check(r, s) {
+      const g = await gear.list();
+      const p = r === 'raid' ? await pickRaid(s.raid, g) : pick(g.weapons, r);
+      if (p && p.measure) {   // measured on the next check, with this weapon armed
+        await trap.arm(p.measure.type, 'weapon', p.measure.name);
+        return;
+      }
+      if (!p || p.none) {
+        const msg = `Auto Trap: no ${p ? p.none : 'Law'} weapon owned, weapon left alone`;
+        if (!warned.has(msg)) log(msg);
+        warned.add(msg);
       } else if (trap.weapon() !== p.weapon.name) {
         await trap.arm(p.weapon.type, 'weapon', p.weapon.name);
         log(`✔ Weapon: ${p.weapon.name} (${p.reason})`);
       }
-      checkedKey = key(r);
+      checkedKey = key(r, s);
     }
 
     return {
       role,
       pick,
-      // A weapon check when the role or the armed weapon changed since the last one.
+      // A weapon check when the role (or raid) or the armed weapon changed since the last one.
       action(s) {
         const r = role(s);
-        if (!r || checkedKey === key(r) || backedOff('weapon')) return null;
-        return { kind: 'weapon', label: r === 'claw' ? 'Weapon check (curds)' : 'Weapon check (shipment)', run: () => check(r) };
+        if (!r || checkedKey === key(r, s) || backedOff('weapon')) return null;
+        return { kind: 'weapon', label: LABELS[r], run: () => check(r, s) };
       },
     };
   }
 
   const weapon = makeWeapon({
-    gear: { list: () => getGear(true) },
+    gear: { list: () => getGear(true), armed: (g) => armedGear(g) },
     trap: {
       weapon: () => (window.user || {}).weapon_name,
+      powerType: () => (window.user || {}).trap_power_type_name,
       arm: (type, classification, name) => armGear(type, classification, name),
     },
+    minluck,
+    cache: {
+      get: (k) => { const v = raidStore.minluck[k]; return v === 'inf' ? Infinity : v; },
+      set: (k, v) => { raidStore.minluck[k] = v === Infinity ? 'inf' : v; saveRaidStore(); },
+    },
     config: () => cfg,
+    charmMin: () => charmMin(),
     backedOff: (kind) => backedOff(kind),
     log: (msg) => log(msg),
   });
 
   async function startRaid(raid) {
-    // Remember the current weapon so it can be restored when the raid ends.
-    const gear = await getGear(true);
-    const cur = armedGear(gear);
-    raids.starting(raid.name, cur.weapon ? { type: cur.weapon.type, name: cur.weapon.name } : null);
-
     let view = $1(SEL.raidDialog);
     if (!view) {
       if ($1(SEL.hudDialog)) closeHudDialog();
@@ -1722,6 +1702,8 @@
 #${PANEL_ID} .mhcs-sec{border-top:1px solid #303747;padding-top:6px;margin-top:6px;}
 #${PANEL_ID} label{display:flex;align-items:center;gap:6px;margin:3px 0;color:#e6e9ef !important;font:inherit;}
 #${PANEL_ID} label.mhcs-row{justify-content:space-between;}
+#${PANEL_ID} label.mhcs-stack{flex-direction:column;align-items:stretch;gap:3px;}
+#${PANEL_ID} label.mhcs-stack select{max-width:none;width:100%;}
 #${PANEL_ID} .mhcs-reset{display:block;margin:8px 0 0 auto;background:none;border:0;padding:0;color:#8b93a3;font:inherit;font-size:11px;text-decoration:underline;cursor:pointer;}
 #${PANEL_ID} .mhcs-reset:hover,#${PANEL_ID} .mhcs-reset.mhcs-armed{color:var(--err);}
 #${PANEL_ID} label.mhcs-bocc{display:none;}
@@ -1736,7 +1718,7 @@
 #${PANEL_ID} .mhcs-pause.mhcs-running:hover{background:color-mix(in srgb,var(--ok) 18%,transparent);}
 #${PANEL_ID} select,#${PANEL_ID} input[type=number]{background:#11151b;color:#e6e9ef;border:1px solid #3a4150;border-radius:4px;
   padding:2px 4px;font:inherit;}
-#${PANEL_ID} select{width:150px;}
+#${PANEL_ID} select{max-width:165px;}
 #${PANEL_ID} input[type=number]{width:70px;}
 #${PANEL_ID} .mhcs-tip{position:absolute;left:8px;right:8px;z-index:3;display:none;pointer-events:none;background:#0d1117;color:#e6e9ef;border:1px solid #3a4150;border-radius:6px;padding:6px 8px;font-size:11px;line-height:1.4;box-shadow:0 4px 12px rgba(0,0,0,.5);}
 #${PANEL_ID} summary{cursor:pointer;color:#8b93a3;user-select:none;}
@@ -1746,9 +1728,10 @@
 
   const TOGGLES = [
     ['autoLaunch', 'Auto Launch', `Launches the best affordable shipment above your reserves. Skips ${INTEL_CAP}+ intel.`],
+    ['autoRaid', 'Auto Raid', `Starts a raid at ${INTEL_CAP} intel with ${RAID_MIN_BOCCONCINI}+ Bocconcini.`],
     ['autoBait', 'Auto Bait', 'Arms the right bait in flight, on raids and docked.'],
+    ['autoTrap', 'Auto Trap', 'C.L.A.W. for curds with Gouda or SUPER|brie+, else luckiest Law; best allowed type on raids.'],
     ['autoCraft', 'Auto Craft', `Crafts Swiss below ${MIN_SWISS}, and ${RAID_MIN_BOCCONCINI} Bocconcini before a raid.`],
-    ['autoRaid', 'Auto Raid', `Starts a raid at ${INTEL_CAP} intel with ${RAID_MIN_BOCCONCINI}+ Bocconcini. Restores your trap after.`],
   ];
 
   const HTML = `
@@ -1766,44 +1749,42 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
 `).join('')}    </div>
   </div>
   <details class="mhcs-sec" data-fold="showSettings"><summary>Settings</summary>
-    <div class="mhcs-subhead">Shipments</div>
-    <label class="mhcs-row"><span>Bait</span>
+    <div class="mhcs-subhead">Bait</div>
+    <label class="mhcs-stack"><span>Shipment bait</span>
       <select data-c="spiceMode">
         <option value="swiss">Sky Pirate Swiss</option>
         <option value="romano">Sky Raider Romano</option>
         <option value="bocconcini">Aurora Bocconcini</option>
-        <option value="bocconcini_spice">Bocconcini, Spice only</option>
+        <option value="bocconcini_spice">Aurora Bocconcini (Spice only)</option>
       </select></label>
     <div class="mhcs-hint" data-f="baitHint"></div>
-    <label class="mhcs-row mhcs-bocc" data-tip="Keep some for raids (a raid needs ${RAID_MIN_BOCCONCINI}). 0 = none."><span>Min Bocconcini</span> <input type="number" min="0" step="1" data-c="boccMin"></label>
-    <label class="mhcs-row" data-tip="With Bocconcini: removed when another bait goes on."><span>Luck charms</span>
-      <select data-c="luckCharmsNormal">
-        <option value="off">Off</option>
-        <option value="bocconcini">With Bocconcini</option>
-        <option value="always">Always</option>
-      </select></label>
-    <label data-tip="While you have any."><input type="checkbox" data-c="cannonShip"> Cannonballs</label>
-    <div class="mhcs-subhead">Docked</div>
-    <label class="mhcs-row" data-tip="Gouda and SUPER|brie+ farm Corsair's Curds."><span>Bait</span>
+    <label class="mhcs-row mhcs-bocc" data-tip="Keep some for raids (a raid needs ${RAID_MIN_BOCCONCINI}). 0 = none."><span>Min Bocconcini to keep</span> <input type="number" min="0" step="1" data-c="boccMin"></label>
+    <label class="mhcs-stack" data-tip="Gouda and SUPER|brie+ farm Corsair's Curds."><span>Docked bait</span>
       <select data-c="dockedAction">
         <option value="gouda">Gouda</option>
         <option value="superbrie">SUPER|brie+</option>
         <option value="disarm">Disarm</option>
         <option value="none">Leave as-is</option>
       </select></label>
-    <div class="mhcs-subhead">Raids</div>
-    <label data-tip="Closes the gap to minluck. Removed after the raid."><input type="checkbox" data-c="luckCharmsRaid"> Luck charms</label>
-    <label class="mhcs-row" data-tip="Enough: one per raid hunt left. Off: switch left alone."><span>Cannonballs</span>
-      <select data-c="cannonRaid">
+    <div class="mhcs-subhead">Luck Charms</div>
+    <label data-tip="Closes the gap to minluck. Removed after the raid."><input type="checkbox" data-c="luckCharmsRaid"> Luck charms on raids</label>
+    <label class="mhcs-stack" data-tip="Only with Bocconcini: removed when another bait goes on."><span>Luck charms on shipments</span>
+      <select data-c="luckCharmsNormal">
         <option value="off">Off</option>
-        <option value="enough">If enough (25+)</option>
+        <option value="bocconcini">Only with Bocconcini</option>
         <option value="always">Always</option>
       </select></label>
-    <div class="mhcs-subhead">Trap</div>
-    <label data-tip="C.L.A.W. Machine with Gouda or SUPER|brie+ (double curds), else your luckiest Law weapon. Not on raids."><input type="checkbox" data-c="autoWeapon"> Auto weapon</label>
     <label class="mhcs-row" data-tip="Only charms you hold more of. 0 = any."><span>Min charms to use</span> <input type="number" min="0" step="1" data-c="charmMinQty"></label>
+    <div class="mhcs-subhead">Cannonballs</div>
+    <label class="mhcs-stack" data-tip="Only with enough: one per raid hunt left. Off: switch left alone."><span>Cannonballs on raids</span>
+      <select data-c="cannonRaid">
+        <option value="off">Off</option>
+        <option value="enough">Only with enough (25+)</option>
+        <option value="always">Always</option>
+      </select></label>
+    <label data-tip="While you have any."><input type="checkbox" data-c="cannonShip"> Cannonballs on shipments</label>
     <div class="mhcs-subhead">Crafting</div>
-    <label data-tip="2 cheese per craft; Gold when out. Off: Gold only."><input type="checkbox" data-c="craftEssence"> Use Magic Essence</label>
+    <label data-tip="2 cheese per craft; Gold when out. Off: Gold only."><input type="checkbox" data-c="craftEssence"> Use Magic Essence (Recommended)</label>
     <div class="mhcs-subhead">Reserves</div>
     <label class="mhcs-row" data-tipfor="minDebris"><span>Min Debris</span> <input type="number" min="0" step="1" data-c="minDebris"></label>
     <label class="mhcs-row" data-tipfor="minGas"><span>Min Gas</span> <input type="number" min="0" step="1" data-c="minGas"></label>
