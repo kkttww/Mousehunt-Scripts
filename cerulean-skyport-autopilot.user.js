@@ -279,6 +279,7 @@
     minCloudstone: 120,
     autoRaid: true,           // start raids when intel >= 50 and Bocconcini >= 25
     craftEssence: true,       // craft with Magic Essence (Gold as fallback); off = Gold recipes only
+    autoWeapon: true,         // C.L.A.W. Machine with standard cheese, luckiest Law weapon on shipments (not raids)
     luckCharmsRaid: true,     // pick luck charms during raids
     luckCharmsNormal: 'bocconcini', // luck charms during shipments: 'off' | 'bocconcini' (only while Bocconcini is armed) | 'always'
     charmMinQty: CHARM_MIN_QTY, // only luck charms held in quantities above this are used
@@ -674,9 +675,9 @@
     return { kind: 'fuel', label: `Turn RaidBuster Cannonballs ${want ? 'on' : 'off'}`, run: () => setFuel(want) };
   }
 
-  // ctx: { cfg, backedOff(kind), lastCraft, now, shipCharm, raids } (the live objects in tick(), fakes in tests).
+  // ctx: { cfg, backedOff(kind), lastCraft, now, shipCharm, raids, weapon } (the live objects in tick(), fakes in tests).
   function decide(s, ctx) {
-    const { cfg, backedOff, shipCharm, raids } = ctx;
+    const { cfg, backedOff, shipCharm, raids, weapon } = ctx;
     const lead = s.isIntercepting || raids.isActive() ? 'Raid' : s.inFlight ? 'In flight' : 'Docked';
     const fuel = fuelAction(s, ctx);
     if (s.isIntercepting) {
@@ -693,9 +694,14 @@
 
     if (s.inFlight) {
       const head = `${s.shipName || 'shipment'}, ${s.hunts} hunts left`;
-      if (!cfg.autoBait) return decision(lead, `${head} (bait swap off)`);
+      if (!cfg.autoBait) {
+        const wpn = weapon.action(s);
+        return wpn ? doing(lead, wpn) : decision(lead, `${head} (bait swap off)`);
+      }
       const want = shipmentBait(s, cfg).forShipment(s.shipType);
       if (s.baitKey === want) {
+        const wpn = weapon.action(s);
+        if (wpn) return doing(lead, wpn);
         const luck = shipCharm.luckAction(s);
         if (luck) return doing(lead, luck);
         return decision(lead, `${head}, ${armedText(s, BAITS[want].label)}${shipCharm.note ? ` · ${shipCharm.note}` : ''}`);
@@ -769,15 +775,16 @@
   }
 
   function dockedBaitDecision(s, ctx, note, warn) {
-    const { cfg, backedOff } = ctx;
+    const { cfg, backedOff, weapon } = ctx;
     const parts = note ? [note] : [];
     const docked = (tail, w = warn) => decision('Docked', [...parts, tail].filter(Boolean).join(' · '), w);
-    if (!cfg.autoBait || cfg.dockedAction === 'none') return docked('');
+    const wpn = weapon.action(s);
+    if (!cfg.autoBait || cfg.dockedAction === 'none') return wpn ? doing('Docked', wpn) : docked('');
     if (backedOff('bait')) return docked('bait swap backing off', true);
     if (cfg.dockedAction === 'gouda' || cfg.dockedAction === 'superbrie') {
       // Only the selected cheese; no switching to the other one when it runs out.
       const want = cfg.dockedAction;
-      if (s.baitKey === want) return docked(armedText(s, BAITS[want].label));
+      if (s.baitKey === want) return wpn ? doing('Docked', wpn) : docked(armedText(s, BAITS[want].label));
       if (s[want] > 0) return doing('Docked', { kind: 'bait', label: `Arm ${BAITS[want].label} (docked)`, run: () => armBait(want) });
       parts.push(`out of ${BAITS[want].label}`);
     }
@@ -1334,6 +1341,72 @@
     log: (msg) => log(msg),
   });
 
+  /* ------------------------------------------------------------------ *
+   * Auto weapon: C.L.A.W. Machine for curds, else the luckiest Law weapon
+   * ------------------------------------------------------------------ */
+  // Outside raids (the raid module picks raid weapons). Role 'claw' while Gouda or SUPER|brie+ is armed: the
+  // C.L.A.W. Machine doubles Corsair's Curds, which those mice drop on every catch (without one, the luckiest
+  // Law weapon). Role 'law' while Swiss, Romano or Bocconcini is armed: Skyport shipment mice are all Law.
+  // Seams: gear { list() }, trap { weapon(), arm(type, classification, name) }, config(), backedOff(kind), log(msg).
+  function makeWeapon({ gear, trap, config, backedOff, log }) {
+    const STANDARD = ['gouda', 'superbrie'];
+    const PREMIUM = ['swiss', 'romano', 'bocconcini'];
+    let checkedKey = null;   // role + weapon the last check ran for
+    let noLawLogged = false;
+
+    function role(s) {
+      if (!config().autoWeapon || s.isIntercepting) return null;
+      if (STANDARD.includes(s.baitKey)) return 'claw';
+      if (PREMIUM.includes(s.baitKey)) return 'law';
+      return null;
+    }
+
+    // The weapon for a role, from the owned weapons: { weapon, reason } or null (no Law weapon).
+    function pick(weapons, r) {
+      const claw = r === 'claw' && weapons.find((w) => /C\.L\.A\.W\./i.test(w.name));
+      if (claw) return { weapon: claw, reason: "doubles Corsair's Curds" };
+      const law = weapons.filter((w) => w.powerType === 'Law').sort((a, b) => b.luck - a.luck || b.power - a.power)[0];
+      if (!law) return null;
+      return { weapon: law, reason: r === 'claw' ? 'no C.L.A.W. Machine, luckiest Law weapon' : 'luckiest Law weapon' };
+    }
+
+    const key = (r) => `${r}|${trap.weapon()}`;
+
+    async function check(r) {
+      const p = pick((await gear.list()).weapons, r);
+      if (!p) {
+        if (!noLawLogged) log('Auto weapon: no Law weapon owned, weapon left alone');
+        noLawLogged = true;
+      } else if (trap.weapon() !== p.weapon.name) {
+        await trap.arm(p.weapon.type, 'weapon', p.weapon.name);
+        log(`✔ Weapon: ${p.weapon.name} (${p.reason})`);
+      }
+      checkedKey = key(r);
+    }
+
+    return {
+      role,
+      pick,
+      // A weapon check when the role or the armed weapon changed since the last one.
+      action(s) {
+        const r = role(s);
+        if (!r || checkedKey === key(r) || backedOff('weapon')) return null;
+        return { kind: 'weapon', label: r === 'claw' ? 'Weapon check (curds)' : 'Weapon check (shipment)', run: () => check(r) };
+      },
+    };
+  }
+
+  const weapon = makeWeapon({
+    gear: { list: () => getGear(true) },
+    trap: {
+      weapon: () => (window.user || {}).weapon_name,
+      arm: (type, classification, name) => armGear(type, classification, name),
+    },
+    config: () => cfg,
+    backedOff: (kind) => backedOff(kind),
+    log: (msg) => log(msg),
+  });
+
   async function startRaid(raid) {
     // Remember the current weapon so it can be restored when the raid ends.
     const gear = await getGear(true);
@@ -1599,7 +1672,7 @@
       const wait = COOLDOWN_MS - (Date.now() - rt.lastAction);
       if (wait > 0) { scheduleTick(wait + 100); return; }
 
-      const p = decide(s, { cfg, backedOff, lastCraft: rt.lastCraft, now: Date.now(), shipCharm, raids });
+      const p = decide(s, { cfg, backedOff, lastCraft: rt.lastCraft, now: Date.now(), shipCharm, raids, weapon });
       rt.status = planStatus(p, cfg.dryRun);
       if (p.action && !cfg.dryRun) {
         updateUI();
@@ -1721,6 +1794,8 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
         <option value="disarm">Disarm</option>
         <option value="none">Leave as-is</option>
       </select></label>
+    <div class="mhcs-subhead">Trap</div>
+    <label data-tip="C.L.A.W. Machine while Gouda or SUPER|brie+ is armed (doubles Corsair's Curds; without one, your luckiest Law weapon). Your luckiest Law weapon on Swiss, Romano and Bocconcini shipments. Raids pick their own weapon."><input type="checkbox" data-c="autoWeapon"> Auto weapon</label>
     <div class="mhcs-subhead">Luck Charms</div>
 ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="checkbox" data-c="${key}"> ${text}</label>
 `).join('')}    <label class="mhcs-stack" data-tip="Same charm choice as raids, during shipments. Only with Bocconcini: only while Aurora Bocconcini is armed; the charm comes off when Swiss or your docked bait goes on."><span>Luck charms on shipments</span>
