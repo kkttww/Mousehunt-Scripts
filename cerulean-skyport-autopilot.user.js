@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MouseHunt Cerulean Skyport Autopilot (Kane)
 // @namespace    https://greasyfork.org/en/users/979741
-// @version      1.0.2
+// @version      1.0.3
 // @description  Runs Cerulean Skyport for you: launches airship shipments, swaps bait, crafts Sky Pirate Swiss and Aurora Bocconcini, and starts raids with the luckiest weapon and luck charms. Starts paused so you can check its plan first. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
 // @author       Kane
 // @license      MIT
@@ -271,7 +271,8 @@
     autoLaunch: true,
     autoBait: true,
     autoCraft: true,
-    spiceMode: 'swiss',       // 'swiss' | 'romano' | 'bocconcini'
+    spiceMode: 'bocconcini_spice', // 'swiss' | 'romano' | 'bocconcini' | 'bocconcini_spice' (Spice shipments only)
+    boccMin: 0,               // Bocconcini modes: keep at least this many (0 = no minimum)
     dockedAction: 'gouda',    // 'gouda' | 'superbrie' | 'disarm' | 'none'
     minDebris: 60,
     minGas: 90,
@@ -279,9 +280,9 @@
     autoRaid: true,           // start raids when intel >= 50 and Bocconcini >= 25
     craftEssence: true,       // craft with Magic Essence (Gold as fallback); off = Gold recipes only
     luckCharmsRaid: true,     // pick luck charms during raids
-    luckCharmsNormal: false,  // also pick luck charms during normal shipments
+    luckCharmsNormal: 'bocconcini', // luck charms during shipments: 'off' | 'bocconcini' (only while Bocconcini is armed) | 'always'
     charmMinQty: CHARM_MIN_QTY, // only luck charms held in quantities above this are used
-    cannonRaid: 'off',        // RaidBuster Cannonballs on raids: 'off' | 'always' | 'enough' (only with enough for the rest of the raid)
+    cannonRaid: 'enough',     // RaidBuster Cannonballs on raids: 'off' | 'always' | 'enough' (only with enough for the rest of the raid)
     cannonShip: false,        // RaidBuster Cannonballs during shipments
     dryRun: true,            // Pause: log decisions without acting (click the Pause button to go live)
     minimized: false,
@@ -296,7 +297,9 @@
   function loadConfig() {
     try {
       const raw = localStorage.getItem(STORE_KEY);
-      return Object.assign({}, DEFAULTS, raw ? JSON.parse(raw) : {});
+      const c = Object.assign({}, DEFAULTS, raw ? JSON.parse(raw) : {});
+      if (typeof c.luckCharmsNormal === 'boolean') c.luckCharmsNormal = c.luckCharmsNormal ? 'always' : 'off';
+      return c;
     } catch (e) {
       return Object.assign({}, DEFAULTS);
     }
@@ -498,9 +501,19 @@
   /* ------------------------------------------------------------------ *
    * Strategy
    * ------------------------------------------------------------------ */
+  const isBoccMode = () => cfg.spiceMode === 'bocconcini' || cfg.spiceMode === 'bocconcini_spice';
+
+  // Bocconcini on shipments only while above the Min to keep (0 = no minimum).
+  function boccAllowed(s) {
+    return s.bocconcini > Math.max(0, toNum(cfg.boccMin));
+  }
+
   function flightBaitFor(shipType, s) {
-    // Romano or Bocconcini on every shipment while you have any; Swiss otherwise.
-    if ((cfg.spiceMode === 'romano' || cfg.spiceMode === 'bocconcini') && s[cfg.spiceMode] > 0) return cfg.spiceMode;
+    // Romano on every shipment while you have any; Bocconcini on every (or only Spice) shipment while
+    // above the Min to keep; Swiss otherwise.
+    if (cfg.spiceMode === 'romano') return s.romano > 0 ? 'romano' : 'swiss';
+    if (cfg.spiceMode === 'bocconcini_spice' && shipType !== 'spice_shipment') return 'swiss';
+    if (isBoccMode() && boccAllowed(s)) return 'bocconcini';
     return 'swiss';
   }
 
@@ -632,13 +645,15 @@
       if (backedOff('raid')) return { status: 'Raid over, trap restore backing off' };
       return { status: 'Raid over, restoring trap', kind: 'raid', label: 'Restore trap', done: '', run: () => restoreAfterRaid() };
     }
+    const cleanup = shipCharmCleanup(s);
+    if (cleanup) return cleanup;
 
     if (s.inFlight) {
       const head = `In flight: ${s.shipName || 'shipment'}, ${s.hunts} hunts left`;
       if (!cfg.autoBait) return { status: `${head} (bait swap off)` };
       const want = flightBaitFor(s.shipType, s);
       if (s.baitKey === want) {
-        if (cfg.luckCharmsNormal && rt.normalLuckKey !== flightLuckKey(s) && !backedOff('luck')) {
+        if (shipLuckWanted(s) && rt.normalLuckKey !== flightLuckKey(s) && !backedOff('luck')) {
           return { status: `${head}, checking luck`, kind: 'luck', label: 'Luck check (shipment)', run: () => normalLuckStep(s) };
         }
         return { status: `${head}, ${BAITS[want].label} armed${rt.luckNote ? ` · ${rt.luckNote}` : ''}` };
@@ -978,6 +993,7 @@
         note: '',
       };
       raidStore.pending = null;
+      raidStore.shipCharm = null;   // the raid manages (and later removes) the charm
       saveRaidStore();
       return;
     }
@@ -1072,12 +1088,41 @@
     return `${s.shipType}|${u.weapon_name}|${u.base_name}|${u.bait_name}`;
   }
 
+  // Shipment luck charms: 'always', or 'bocconcini' only while Aurora Bocconcini is the armed bait.
+  function shipLuckWanted(s) {
+    return cfg.luckCharmsNormal === 'always' || (cfg.luckCharmsNormal === 'bocconcini' && s.baitKey === 'bocconcini');
+  }
+
   async function normalLuckStep(s) {
     const gear = await getGear(true);
     const ml = await currentMinluck();
+    const before = (window.user || {}).trinket_name || null;
     rt.luckNote = await applyLuckCharm(ml.value, gear, ml.source);
     rt.normalLuckKey = flightLuckKey(s);
+    const after = (window.user || {}).trinket_name || null;
+    if (after !== before) { raidStore.shipCharm = after; saveRaidStore(); }
     log(`✔ Shipment luck: ${rt.luckNote}`);
+  }
+
+  // 'Only with Bocconcini': the charm this script armed for a shipment comes off as soon as another bait
+  // is armed (Swiss after Bocconcini runs out, or the docked bait). A charm you changed yourself is left alone.
+  function shipCharmCleanup(s) {
+    const charm = raidStore.shipCharm;
+    if (!charm || cfg.luckCharmsNormal !== 'bocconcini' || s.isIntercepting || raidStore.active || s.baitKey === 'bocconcini') return null;
+    if ((window.user || {}).trinket_name !== charm) {
+      raidStore.shipCharm = null;
+      saveRaidStore();
+      return null;
+    }
+    if (backedOff('luck')) return null;
+    const label = `Remove ${charm} (Bocconcini not armed)`;
+    return { status: label, kind: 'luck', label, run: async () => {
+      await disarmCharm();
+      raidStore.shipCharm = null;
+      rt.luckNote = '';
+      rt.normalLuckKey = null;
+      saveRaidStore();
+    } };
   }
 
   async function startRaid(raid) {
@@ -1277,9 +1322,14 @@
   // Each problem is logged once when it starts and (if it has a clear message) once when it clears.
   function problemsFor(s) {
     const out = {};
-    const pick = cfg.spiceMode;
+    const pick = isBoccMode() ? 'bocconcini' : cfg.spiceMode;
     if ((pick === 'romano' || pick === 'bocconcini') && s[pick] <= 0) {
-      out[`out:${pick}`] = [`⚠ Out of ${BAITS[pick].label}, using Swiss`, `✔ ${BAITS[pick].label} back in stock`];
+      out[`out:${pick}`] = [`⚠ Out of ${BAITS[pick].label}, using Swiss on every shipment`, `✔ ${BAITS[pick].label} back in stock`];
+    } else if (pick === 'bocconcini') {
+      const min = toNum(cfg.boccMin);
+      if (min > 0 && s.bocconcini <= min) {
+        out['bocc:min'] = [`⚠ Bocconcini at minimum (${min}), using Swiss on every shipment`, '✔ Bocconcini above minimum again'];
+      }
     }
     if (s.swiss <= 0) out['out:swiss'] = ['⚠ Out of Sky Pirate Swiss', '✔ Sky Pirate Swiss back in stock'];
     if (cfg.autoLaunch && !s.isShipping && !s.isIntercepting) {
@@ -1417,6 +1467,9 @@
 #${PANEL_ID} label.mhcs-stack select{max-width:none;width:100%;}
 #${PANEL_ID} .mhcs-reset{display:block;margin:8px 0 0 auto;background:none;border:0;padding:0;color:#8b93a3;font:inherit;font-size:11px;text-decoration:underline;cursor:pointer;}
 #${PANEL_ID} .mhcs-reset:hover,#${PANEL_ID} .mhcs-reset.mhcs-armed{color:var(--err);}
+#${PANEL_ID} label.mhcs-bocc{display:none;}
+#${PANEL_ID}.mhcs-show-bocc label.mhcs-bocc{display:flex;}
+#${PANEL_ID} .mhcs-hint{color:#8b93a3;font-size:11px;line-height:1.35;margin:2px 0 4px;}
 #${PANEL_ID} .mhcs-subhead{color:#8b93a3;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;margin:8px 0 2px;}
 #${PANEL_ID} .mhcs-subhead:first-of-type{margin-top:4px;}
 #${PANEL_ID} .mhcs-pause{flex:none;margin-right:6px;padding:1px 8px;height:20px;border-radius:999px;cursor:pointer;font:600 11px/16px -apple-system,Segoe UI,Roboto,Arial,sans-serif;white-space:nowrap;border:1px solid var(--pause);background:color-mix(in srgb,var(--pause) 18%,transparent);color:var(--pause);}
@@ -1445,11 +1498,16 @@
       `Starts a raid at ${INTEL_CAP} intel with ${RAID_MIN_BOCCONCINI}+ Bocconcini, using your luckiest weapon. Restores your trap after.`],
   ];
 
+  const BAIT_HINTS = {
+    swiss: 'Swiss on every shipment.',
+    romano: 'Romano on every shipment. Out of Romano: Swiss on every shipment.',
+    bocconcini: 'Bocconcini on every shipment. Out of Bocconcini (or at your minimum): Swiss on every shipment.',
+    bocconcini_spice: 'Spice: Bocconcini · Cloudstone and Gas: Swiss. Out of Bocconcini (or at your minimum): Swiss on every shipment.',
+  };
+
   const SETTING_TOGGLES = [
     ['luckCharmsRaid', 'Luck charms on raids',
       'If your luck is below minluck, arms the weakest charm that closes the gap (or your strongest). Removed after the raid.'],
-    ['luckCharmsNormal', 'Luck charms on shipments',
-      'Same charm choice as raids, during shipments.'],
   ];
 
   const HTML = `
@@ -1468,12 +1526,15 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
   </div>
   <details class="mhcs-sec" data-fold="showSettings"><summary>Settings</summary>
     <div class="mhcs-subhead">Bait</div>
-    <label class="mhcs-stack" data-tip="Cheese for every shipment. Romano or Bocconcini while you have any, then Swiss."><span>Shipment bait</span>
+    <label class="mhcs-stack" data-tip="Cheese for shipments. Whenever the chosen cheese runs out (or Bocconcini reaches your minimum), every shipment uses Sky Pirate Swiss."><span>Shipment bait</span>
       <select data-c="spiceMode">
         <option value="swiss">Sky Pirate Swiss</option>
         <option value="romano">Sky Raider Romano</option>
         <option value="bocconcini">Aurora Bocconcini</option>
+        <option value="bocconcini_spice">Aurora Bocconcini (Spice only)</option>
       </select></label>
+    <div class="mhcs-hint" data-f="baitHint"></div>
+    <label class="mhcs-row mhcs-bocc" data-tip="Switches to Swiss when Bocconcini drops to this, so some stay for raids (a raid needs ${RAID_MIN_BOCCONCINI}). 0 = no minimum."><span>Min Bocconcini to keep</span> <input type="number" min="0" step="1" data-c="boccMin"></label>
     <label class="mhcs-stack" data-tip="Bait while docked. Gouda or SUPER|brie+ farm Curd for Swiss."><span>Docked bait</span>
       <select data-c="dockedAction">
         <option value="gouda">Gouda</option>
@@ -1483,7 +1544,13 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
       </select></label>
     <div class="mhcs-subhead">Luck Charms</div>
 ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="checkbox" data-c="${key}"> ${text}</label>
-`).join('')}    <label class="mhcs-row" data-tip="Only charms you hold more of than this are used. 0 = any."><span>Min charms to use</span> <input type="number" min="0" step="1" data-c="charmMinQty"></label>
+`).join('')}    <label class="mhcs-stack" data-tip="Same charm choice as raids, during shipments. Only with Bocconcini: only while Aurora Bocconcini is armed; the charm comes off when Swiss or your docked bait goes on."><span>Luck charms on shipments</span>
+      <select data-c="luckCharmsNormal">
+        <option value="off">Off</option>
+        <option value="bocconcini">Only with Bocconcini</option>
+        <option value="always">Always</option>
+      </select></label>
+    <label class="mhcs-row" data-tip="Only charms you hold more of than this are used. 0 = any."><span>Min charms to use</span> <input type="number" min="0" step="1" data-c="charmMinQty"></label>
     <div class="mhcs-subhead">Cannonballs</div>
     <label class="mhcs-stack" data-tip="Only with enough: needs one per raid hunt left (25 for a full raid). Off: leaves the switch alone."><span>Cannonballs on raids</span>
       <select data-c="cannonRaid">
@@ -1584,11 +1651,17 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
       el.addEventListener('toggle', () => { cfg[key] = el.open; saveConfig(); });
     }
 
+    // Spells out which cheese each shipment gets, including the fallback to Swiss.
+    const showBaitMode = () => {
+      panel.classList.toggle('mhcs-show-bocc', isBoccMode());
+      panel.querySelector('[data-f="baitHint"]').textContent = BAIT_HINTS[cfg.spiceMode] || '';
+    };
     const syncInputs = () => {
       for (const el of panel.querySelectorAll('[data-c]')) {
         if (el.type === 'checkbox') el.checked = !!cfg[el.dataset.c];
         else el.value = cfg[el.dataset.c];
       }
+      showBaitMode();
     };
     syncInputs();
     for (const el of panel.querySelectorAll('[data-c]')) {
@@ -1600,6 +1673,7 @@ ${SETTING_TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input
           cfg[key] = n;
           el.value = n;
         } else cfg[key] = el.value;
+        showBaitMode();
         saveConfig();
         refreshTips(readState());
         rt.backoff = {};
