@@ -493,6 +493,15 @@
       bait,
       baitKey: baitKeyOf(bait),
       shipments,
+      // What the decision can use on screen right now (it never queries the page itself).
+      ui: {
+        raidButton: !!$1(SEL.hudRaidButton),
+        raidDialog: !!$1(SEL.raidDialog),
+        shipDialog: !!$1(SEL.shipDialog),
+        shipButtons: Object.fromEntries(SHIPMENTS.map((x) => [x.type, !!$1(SEL.hudShipButton(x.type))])),
+        fuelToggle: !!$1(SEL.hudFuelToggle),
+        craftButtons: { swiss: !!$1(SEL.hudCraftButton), bocconcini: !!$1(SEL.hudBoccCraftButton) },
+      },
     };
     if (s.baitKey && s[s.baitKey] === 0 && bait.qty > 0) s[s.baitKey] = bait.qty;
     return s;
@@ -501,6 +510,10 @@
   /* ------------------------------------------------------------------ *
    * Strategy
    * ------------------------------------------------------------------ */
+  // #region decision
+  // "What would I do now?": readState() and a context in, a decision out. Nothing in this region acts on
+  // the game, writes storage or reads the page; tests extract the whole region (tests/decide.test.js).
+
   // Shipment bait options (cfg.spiceMode). `cheese`: the premium cheese (null = Swiss only); `spiceOnly`:
   // only on Aurora Spice shipments; `useMin`: Min Bocconcini to keep applies. `hint` is shown in the panel.
   const BAIT_MODES = {
@@ -541,14 +554,14 @@
 
   // Returns { sh, skipped } where `skipped` lists affordable shipments passed over because their
   // location already holds enough raid intel (more would be wasted).
-  function pickShipment(s) {
+  function pickShipment(s, c = cfg) {
     const known = Object.keys(s.shipments).length > 0;
     const passed = [];
     const skippedText = () => (passed.length ? `Skipped (intel ≥ ${INTEL_CAP}): ${passed.join(', ')}` : '');
     for (const sh of SHIPMENTS) {
       const live = s.shipments[sh.type];
       if (known && (!live || !live.canShip)) continue;
-      if (s[sh.costKey] < toNum(cfg[sh.reserveKey]) + shipmentCost(sh, s)) continue;
+      if (s[sh.costKey] < toNum(c[sh.reserveKey]) + shipmentCost(sh, s)) continue;
       if (live && live.intel != null && live.intel >= INTEL_CAP) {
         passed.push(`${SHIP_SHORT[sh.type]} → ${live.locationName || 'location'} ${live.intel}`);
         continue;
@@ -560,11 +573,11 @@
 
   // Recipe 2: 20 Curd + 1 Magic Essence -> 2 cheese. Recipe 1: 20 Curd + 2,000 Gold -> 1 cheese.
   // `times` is the craft count typed into the recipe's quantity input.
-  function craftPlan(s, target) {
+  function craftPlan(s, target, c = cfg) {
     const need = Math.max(0, target - s.swiss);
     if (need <= 0) return null;
     const curdBatches = Math.floor(s.curd / 20);
-    const r2 = cfg.craftEssence ? Math.min(curdBatches, Math.floor(s.essence)) : 0;
+    const r2 = c.craftEssence ? Math.min(curdBatches, Math.floor(s.essence)) : 0;
     if (r2 > 0) return { recipe: 2, times: Math.min(r2, Math.ceil(need / 2)) };
     const r1 = Math.min(curdBatches, Math.floor(s.gold / 2000));
     if (r1 > 0) return { recipe: 1, times: Math.min(r1, need) };
@@ -572,11 +585,11 @@
   }
 
   // Bocconcini. Recipe 2: 8 Spice + 1 Essence -> 2 cheese. Recipe 1: 8 Spice + 5,000 Gold -> 1 cheese.
-  function boccCraftPlan(s, target) {
+  function boccCraftPlan(s, target, c = cfg) {
     const need = Math.max(0, target - s.bocconcini);
     if (need <= 0) return null;
     const spiceBatches = Math.floor(s.spice / BOCC_SPICE_PER_CRAFT);
-    const r2 = cfg.craftEssence ? Math.min(spiceBatches, Math.floor(s.essence)) : 0;
+    const r2 = c.craftEssence ? Math.min(spiceBatches, Math.floor(s.essence)) : 0;
     if (r2 > 0) return { recipe: 2, times: Math.min(r2, Math.ceil(need / 2)) };
     const r1 = Math.min(spiceBatches, Math.floor(s.gold / BOCC_GOLD_PER_CRAFT));
     if (r1 > 0) return { recipe: 1, times: Math.min(r1, need) };
@@ -611,151 +624,191 @@
     bocconcini: { key: 'bocconcini', label: 'Bocconcini', button: SEL.hudBoccCraftButton, view: SEL.boccCraftView },
   };
 
-  function craftDecision(s, which = 'swiss', target = MIN_SWISS) {
+  // A decision: the status line's lead ('In flight' | 'Raid' | 'Docked'), its detail, `warn` when something
+  // is failing (retries backing off), and the action to run, { kind, label, run, done }, or null.
+  const decision = (lead, detail, warn = false) => ({ lead, detail, warn, action: null });
+  const doing = (lead, action) => ({ lead, detail: '', warn: false, action });
+
+  const armedText = (s, label) => {
+    const qty = s.bait.armed ? (s.baitKey ? s[s.baitKey] : s.bait.qty) : null;
+    return `${label} armed${qty != null ? ` (${Number(qty).toLocaleString()})` : ''}`;
+  };
+
+  // Crafting a cheese up to `target`: { action } or { note, warn }.
+  function craftDecision(s, ctx, which = 'swiss', target = MIN_SWISS) {
     const c = CRAFTS[which];
-    const last = rt.lastCraft;
-    if (last && last.which === which && Date.now() - last.at < CRAFT_STALE_MS && s[which] <= last.before) {
-      return { status: 'Crafted, waiting for inventory refresh (reload if stuck)' };
+    const last = ctx.lastCraft;
+    if (last && last.which === which && ctx.now - last.at < CRAFT_STALE_MS && s[which] <= last.before) {
+      return { note: 'Crafted, waiting for inventory refresh (reload if stuck)' };
     }
-    if (backedOff('craft')) return { status: 'Craft retry backing off' };
-    const plan = which === 'swiss' ? craftPlan(s, target) : boccCraftPlan(s, target);
+    if (ctx.backedOff('craft')) return { note: 'Craft retry backing off', warn: true };
+    const plan = which === 'swiss' ? craftPlan(s, target, ctx.cfg) : boccCraftPlan(s, target, ctx.cfg);
     if (!plan) {
-      return { status: which === 'swiss'
-        ? `Need ${target} Swiss, not enough Curd + ${cfg.craftEssence ? 'Essence/Gold' : 'Gold'}`
-        : `Need ${target} Bocconcini, not enough Spice + ${cfg.craftEssence ? 'Essence/Gold' : 'Gold'}` };
+      return { note: which === 'swiss'
+        ? `Need ${target} Swiss, not enough Curd + ${ctx.cfg.craftEssence ? 'Essence/Gold' : 'Gold'}`
+        : `Need ${target} Bocconcini, not enough Spice + ${ctx.cfg.craftEssence ? 'Essence/Gold' : 'Gold'}` };
     }
-    if (!$1(c.button)) return { status: `Need ${c.label}, open Camp to auto-craft` };
+    if (!s.ui.craftButtons[which]) return { note: `Need ${c.label}, open Camp to auto-craft` };
     const label = `Craft ${plan.times * (plan.recipe === 2 ? 2 : 1)} ${c.label} (${plan.recipe === 2 ? 'Essence' : 'Gold'})`;
-    return { status: label, kind: 'craft', label, run: () => craftCheese(c, plan, s[which]) };
+    return { action: { kind: 'craft', label, run: () => craftCheese(c, plan, s[which]) } };
   }
 
   // RaidBuster Cannonballs ("fuel"): the HUD toggle switches them on/off. Only managed when one of the
   // cannonball settings is on; otherwise the player's own choice is left alone.
   // Returns true/false, or null when that setting is off (leave the switch as the player set it).
-  function fuelWanted(s) {
+  function fuelWanted(s, c = cfg) {
     if (s.isIntercepting) {
-      if (cfg.cannonRaid === 'always') return s.cannonball > 0;
-      if (cfg.cannonRaid === 'enough') return s.cannonball >= Math.max(1, s.raid.hunts);
+      if (c.cannonRaid === 'always') return s.cannonball > 0;
+      if (c.cannonRaid === 'enough') return s.cannonball >= Math.max(1, s.raid.hunts);
       return null;
     }
-    if (s.inFlight) return cfg.cannonShip ? s.cannonball > 0 : null;
+    if (s.inFlight) return c.cannonShip ? s.cannonball > 0 : null;
     return null;
   }
 
-  function fuelDecision(s) {
-    const want = fuelWanted(s);
+  function fuelAction(s, ctx) {
+    const want = fuelWanted(s, ctx.cfg);
     if (want === null || want === s.fuelOn) return null;
     if (want && !s.canFuel) return null;
-    if (backedOff('fuel') || !$1(SEL.hudFuelToggle)) return null;
-    const label = `Turn RaidBuster Cannonballs ${want ? 'on' : 'off'}`;
-    return { status: label, kind: 'fuel', label, run: () => setFuel(want) };
+    if (ctx.backedOff('fuel') || !s.ui.fuelToggle) return null;
+    return { kind: 'fuel', label: `Turn RaidBuster Cannonballs ${want ? 'on' : 'off'}`, run: () => setFuel(want) };
   }
 
-  function decide(s) {
-    const fuel = fuelDecision(s);
+  // ctx: { cfg, backedOff(kind), lastCraft, now, shipCharm, raids } (the live objects in tick(), fakes in tests).
+  function decide(s, ctx) {
+    const { cfg, backedOff, shipCharm, raids } = ctx;
+    const lead = s.isIntercepting || raids.isActive() ? 'Raid' : s.inFlight ? 'In flight' : 'Docked';
+    const fuel = fuelAction(s, ctx);
     if (s.isIntercepting) {
-      const r = raidDecision(s);
-      return r.run || !fuel ? r : fuel;   // weapon / charm / bait setup first, then cannonballs
+      const r = raidDecision(s, ctx);
+      return r.action || !fuel ? r : doing(lead, fuel);   // weapon / charm / bait setup first, then cannonballs
     }
-    if (fuel) return fuel;
+    if (fuel) return doing(lead, fuel);
     if (raids.isActive()) {
-      if (backedOff('raid')) return { status: 'Raid over, trap restore backing off' };
-      return { status: 'Raid over, restoring trap', kind: 'raid', label: 'Restore trap', done: '', run: () => raids.restore() };
+      if (backedOff('raid')) return decision(lead, 'Raid over, trap restore backing off', true);
+      return doing(lead, { kind: 'raid', label: 'Restore trap', done: '', run: () => raids.restore() });
     }
     const cleanup = shipCharm.cleanupAction(s);
-    if (cleanup) return cleanup;
+    if (cleanup) return doing(lead, cleanup);
 
     if (s.inFlight) {
-      const head = `In flight: ${s.shipName || 'shipment'}, ${s.hunts} hunts left`;
-      if (!cfg.autoBait) return { status: `${head} (bait swap off)` };
-      const want = shipmentBait(s).forShipment(s.shipType);
+      const head = `${s.shipName || 'shipment'}, ${s.hunts} hunts left`;
+      if (!cfg.autoBait) return decision(lead, `${head} (bait swap off)`);
+      const want = shipmentBait(s, cfg).forShipment(s.shipType);
       if (s.baitKey === want) {
         const luck = shipCharm.luckAction(s);
-        if (luck) return Object.assign({ status: `${head}, checking luck` }, luck);
-        return { status: `${head}, ${BAITS[want].label} armed${shipCharm.note ? ` · ${shipCharm.note}` : ''}` };
+        if (luck) return doing(lead, luck);
+        return decision(lead, `${head}, ${armedText(s, BAITS[want].label)}${shipCharm.note ? ` · ${shipCharm.note}` : ''}`);
       }
       if (s[want] <= 0) {
         if (want === 'swiss' && cfg.autoCraft) {
-          const c = craftDecision(s);
-          if (c.run) return c;
-          return { status: `${head}, out of Swiss. ${c.status}` };
+          const c = craftDecision(s, ctx);
+          if (c.action) return doing(lead, c.action);
+          return decision(lead, `${head}, out of Swiss. ${c.note}`, !!c.warn);
         }
-        return { status: `${head}, out of ${BAITS[want].label}` };
+        return decision(lead, `${head}, out of ${BAITS[want].label}`);
       }
-      if (backedOff('bait')) return { status: `${head}, bait swap backing off` };
-      const label = `Arm ${BAITS[want].label}`;
-      return { status: label, kind: 'bait', label, run: () => armBait(want) };
+      if (backedOff('bait')) return decision(lead, `${head}, bait swap backing off`, true);
+      return doing(lead, { kind: 'bait', label: `Arm ${BAITS[want].label}`, run: () => armBait(want) });
     }
 
-    // Docked
+    // Docked: a raid, else a launch, else the docked bait. `note` says why nothing launched.
     let note = '';
+    let warn = false;
     if (cfg.autoRaid && !s.isShipping) {
       const raid = pickRaid(s);
       if (raid) {
         if (s.bocconcini < RAID_MIN_BOCCONCINI) {
-          const c = cfg.autoCraft ? craftDecision(s, 'bocconcini', RAID_MIN_BOCCONCINI) : { status: 'auto-craft off' };
-          if (c.run) return c;
-          note = `${raid.name} raid ready, need ${RAID_MIN_BOCCONCINI} Bocconcini (${c.status})`;
-        } else if (!$1(SEL.hudRaidButton) && !$1(SEL.raidDialog)) {
+          const c = cfg.autoCraft ? craftDecision(s, ctx, 'bocconcini', RAID_MIN_BOCCONCINI) : { note: 'auto-craft off' };
+          if (c.action) return doing(lead, c.action);
+          note = `${raid.name} raid ready, need ${RAID_MIN_BOCCONCINI} Bocconcini (${c.note})`;
+          warn = !!c.warn;
+        } else if (!s.ui.raidButton && !s.ui.raidDialog) {
           note = `${raid.name} raid ready, open Camp to start`;
         } else if (backedOff('raidStart')) {
           note = 'Raid start retry backing off';
+          warn = true;
         } else {
-          const label = `Start ${raid.name} raid`;
-          return { status: label, kind: 'raidStart', label, done: '', run: () => startRaid(raid) };
+          return doing(lead, { kind: 'raidStart', label: `Start ${raid.name} raid`, done: '', run: () => startRaid(raid) });
         }
       }
     }
     if (cfg.autoLaunch && !s.isShipping) {
-      const { sh, skipped, allCapped } = pickShipment(s);
+      const { sh, skipped, allCapped } = pickShipment(s, cfg);
       if (skipped) note = note ? `${note} · ${skipped}` : skipped;
       if (!sh) {
         note = allCapped
           ? `${skipped}, every affordable route is full; start a raid or wait for rotation`
           : 'No shipment affordable above reserves';
-      } else if (!$1(SEL.hudShipButton(sh.type)) && !$1(SEL.shipDialog)) {
+        warn = false;
+      } else if (!s.ui.shipButtons[sh.type] && !s.ui.shipDialog) {
         note = `Ready for ${sh.label}, open Camp to launch`;
+        warn = false;
       } else {
-        const cheese = shipmentBait(s).forShipment(sh.type);
+        const cheese = shipmentBait(s, cfg).forShipment(sh.type);
         if (cheese === 'swiss' && s.swiss < MIN_SWISS) {
           if (cfg.autoCraft) {
-            const c = craftDecision(s);
-            if (c.run) return c;
-            note = c.status;
+            const c = craftDecision(s, ctx);
+            if (c.action) return doing(lead, c.action);
+            note = c.note;
+            warn = !!c.warn;
           } else {
             note = `Need ${MIN_SWISS} Swiss to launch (auto-craft off)`;
+            warn = false;
           }
         } else if (backedOff('launch')) {
           note = 'Launch retry backing off';
+          warn = true;
         } else {
           const label = `Launch ${SHIP_SHORT[sh.type]} Shipment (${BAITS[cheese].label})`;
-          return { status: label, kind: 'launch', label, done: '', run: () => launchShipment(sh, cheese) };
+          return doing(lead, { kind: 'launch', label, done: '', run: () => launchShipment(sh, cheese) });
         }
       }
     }
-    return dockedBaitDecision(s, note);
+    return dockedBaitDecision(s, ctx, note, warn);
   }
 
-  function dockedBaitDecision(s, note) {
-    let pre = note ? `${note} · ` : '';
-    if (!cfg.autoBait || cfg.dockedAction === 'none') return { status: `${pre}Docked` };
-    if (backedOff('bait')) return { status: `${pre}Docked, bait swap backing off` };
+  function dockedBaitDecision(s, ctx, note, warn) {
+    const { cfg, backedOff } = ctx;
+    const parts = note ? [note] : [];
+    const docked = (tail, w = warn) => decision('Docked', [...parts, tail].filter(Boolean).join(' · '), w);
+    if (!cfg.autoBait || cfg.dockedAction === 'none') return docked('');
+    if (backedOff('bait')) return docked('bait swap backing off', true);
     if (cfg.dockedAction === 'gouda' || cfg.dockedAction === 'superbrie') {
       // Only the selected cheese; no switching to the other one when it runs out.
       const want = cfg.dockedAction;
-      if (s.baitKey === want) return { status: `${pre}Docked, ${BAITS[want].label} armed` };
-      if (s[want] > 0) {
-        const label = `Arm ${BAITS[want].label}`;
-        return { status: label, kind: 'bait', label: `${label} (docked)`, run: () => armBait(want) };
-      }
-      pre += `out of ${BAITS[want].label} · `;
+      if (s.baitKey === want) return docked(armedText(s, BAITS[want].label));
+      if (s[want] > 0) return doing('Docked', { kind: 'bait', label: `Arm ${BAITS[want].label} (docked)`, run: () => armBait(want) });
+      parts.push(`out of ${BAITS[want].label}`);
     }
     const premium = s.baitKey === 'swiss' || s.baitKey === 'bocconcini' || s.baitKey === 'romano';
     if (s.bait.armed && (cfg.dockedAction === 'disarm' || premium)) {
-      return { status: 'Disarm bait', kind: 'bait', label: 'Disarm bait (docked)', run: () => disarmBait() };
+      return doing('Docked', { kind: 'bait', label: 'Disarm bait (docked)', run: () => disarmBait() });
     }
-    return { status: `${pre}Docked, ${s.bait.armed ? 'bait idle' : 'disarmed'}` };
+    return docked(s.bait.armed ? 'bait idle' : 'disarmed');
   }
+
+  // Intercepting a raid: raid setup (raids module) around arming / crafting Bocconcini, then the status.
+  function raidDecision(s, ctx) {
+    const { cfg, raids } = ctx;
+    const r = s.raid;
+    const head = `${r.name}, ${r.hunts} hunts left`;
+    const init = raids.initAction(s);
+    if (init) return doing('Raid', init);
+    if (cfg.autoBait && s.baitKey !== 'bocconcini') {
+      if (s.bocconcini > 0) return doing('Raid', { kind: 'bait', label: 'Arm Aurora Bocconcini (raid)', run: () => armBait('bocconcini') });
+      if (cfg.autoCraft) {
+        const c = craftDecision(s, ctx, 'bocconcini', Math.max(2, r.hunts));
+        if (c.action) return doing('Raid', c.action);
+        return decision('Raid', `${head}, out of Bocconcini. ${c.note}`, !!c.warn);
+      }
+      return decision('Raid', `${head}, out of Bocconcini`);
+    }
+    const step = raids.stepAction(s);
+    if (step) return doing('Raid', step);
+    return decision('Raid', `${head}${raids.note ? ` · ${raids.note}` : ''}`);
+  }
+  // #endregion decision
 
   /* ------------------------------------------------------------------ *
    * Actions
@@ -992,25 +1045,6 @@
       await armGear(pick.charm.type, 'trinket', pick.charm.name);
     }
     return `${pick.charm.name} +${pick.charm.luck} → luck ${luckNoCharm + pick.charm.luck}/${minluck}${pick.enough ? '' : ' (not guaranteed)'}${src}`;
-  }
-
-  function raidDecision(s) {
-    const r = s.raid;
-    const head = `Raid: ${r.name}, ${r.hunts} hunts left`;
-    const init = raids.initAction(s);
-    if (init) return Object.assign({ status: `${head}, setting up` }, init);
-    if (cfg.autoBait && s.baitKey !== 'bocconcini') {
-      if (s.bocconcini > 0) return { status: `${head}, arming Bocconcini`, kind: 'bait', label: 'Arm Aurora Bocconcini (raid)', run: () => armBait('bocconcini') };
-      if (cfg.autoCraft) {
-        const c = craftDecision(s, 'bocconcini', Math.max(2, r.hunts));
-        if (c.run) return c;
-        return { status: `${head}, out of Bocconcini. ${c.status}` };
-      }
-      return { status: `${head}, out of Bocconcini` };
-    }
-    const step = raids.stepAction(s);
-    if (step) return Object.assign({ status: `${head}, ${step.doing}` }, step);
-    return { status: `${head}${raids.note ? ` · ${raids.note}` : ''}` };
   }
 
   // One raid at a time: pending (remembered when it starts) → weapon → charm → done, then restore after it.
@@ -1542,26 +1576,11 @@
 
   // Status line parts: a coloured dot (kind), a bold lead word and the detail text.
   // kind: ok (in flight), idle (docked), pause (Pause toggle), work (raid / acting), err (failing, KR).
-  function planStatus(s, plan) {
-    if (plan.run && cfg.dryRun) return { kind: 'pause', lead: 'Paused', detail: `would: ${plan.label}` };
-    if (plan.run) return { kind: 'work', lead: 'Working', detail: plan.label };
-    let kind = 'idle';
-    let lead = 'Docked';
-    if (s.isIntercepting || raids.isActive()) { kind = 'work'; lead = 'Raid'; }
-    else if (s.inFlight) { kind = 'ok'; lead = 'In flight'; }
-    const detail = String(plan.status)
-      .replace(/^In flight: /, '')
-      .replace(/^Raid: /, '')
-      .replace(/(^|· )Docked(, )?/, '$1')
-      .replace(/\s*·\s*$/, '')
-      .replace(/ armed\b/, () => {
-        const qty = s.bait.armed ? (s.baitKey ? s[s.baitKey] : s.bait.qty) : null;
-        return qty != null ? ` armed (${Number(qty).toLocaleString()})` : ' armed';
-      })
-      .trim();
-    if (cfg.dryRun) return { kind: 'pause', lead: 'Paused', detail: detail ? `${lead.toLowerCase()}: ${detail}` : lead.toLowerCase() };
-    if (/backing off/i.test(detail)) kind = 'err';
-    return { kind, lead, detail };
+  function planStatus(p, paused) {
+    if (p.action) return paused ? { kind: 'pause', lead: 'Paused', detail: `would: ${p.action.label}` } : { kind: 'work', lead: 'Working', detail: p.action.label };
+    if (paused) return { kind: 'pause', lead: 'Paused', detail: p.detail ? `${p.lead.toLowerCase()}: ${p.detail}` : p.lead.toLowerCase() };
+    const kind = p.warn ? 'err' : p.lead === 'Raid' ? 'work' : p.lead === 'In flight' ? 'ok' : 'idle';
+    return { kind, lead: p.lead, detail: p.detail };
   }
 
   async function tick() {
@@ -1580,11 +1599,11 @@
       const wait = COOLDOWN_MS - (Date.now() - rt.lastAction);
       if (wait > 0) { scheduleTick(wait + 100); return; }
 
-      const plan = decide(s);
-      rt.status = planStatus(s, plan);
-      if (plan.run && !cfg.dryRun) {
+      const p = decide(s, { cfg, backedOff, lastCraft: rt.lastCraft, now: Date.now(), shipCharm, raids });
+      rt.status = planStatus(p, cfg.dryRun);
+      if (p.action && !cfg.dryRun) {
         updateUI();
-        await runAction(plan.kind, plan.label, plan.run, plan.done);
+        await runAction(p.action.kind, p.action.label, p.action.run, p.action.done);
       }
     } catch (e) {
       log(`tick error: ${(e && e.message) || e}`, 'error');
