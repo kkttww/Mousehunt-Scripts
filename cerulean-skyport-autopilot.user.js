@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MouseHunt Cerulean Skyport Autopilot (Kane)
 // @namespace    https://greasyfork.org/en/users/979741
-// @version      1.0.4
+// @version      1.0.5
 // @description  Runs Cerulean Skyport for you: launches airship shipments, swaps bait, crafts Sky Pirate Swiss and Aurora Bocconcini, picks your weapon and luck charms, and starts raids. Starts paused so you can check its plan first. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
 // @author       Kane
 // @license      MIT
@@ -37,6 +37,9 @@
   const MIN_SWISS = 30;              // pre-flight Sky Pirate Swiss requirement
   const INTEL_CAP = 50;              // skip any shipment whose location's raid intel is already >= this (raid cost)
   const COOLDOWN_MS = 4000;          // debounce between actions
+  const QUICK_COOLDOWN_MS = 1000;    // after trap changes and raid start (they wait for the game's reply)
+  const PENDING_MAX_MS = 20000;      // longest a chain of steps holds the horn
+  const QUICK_KINDS = new Set(['weapon', 'base', 'luck', 'bait', 'fuel', 'raid', 'raidStart']);
   const HEARTBEAT_MS = 6000;         // periodic re-evaluation
   const FAIL_BACKOFF_MS = 60000;     // pause an action type after it fails
   const CRAFT_STALE_MS = 5 * 60000;  // don't re-craft while inventory looks unchanged
@@ -202,10 +205,11 @@
       ['gouda', 'Gouda', 'bait/e27d9a7cae531047358a6eccbd729406.jpg'],
       ['superbrie', 'SUPER|brie+', 'bait/ec38729241e103fe744a9ed03409fbd6.jpg'],
     ]],
-    ['Crafting', [
+    ['Crafting · Base', [
       ['curd', 'Curd', 'crafting_items/large/2ffb98531ba5146c1480e1f5939b4578.png'],
       ['spice', 'Spice', 'stats/large/c5bb867c74f9612203085727dea90a23.png'],
       ['essence', 'Essence', 'crafting_items/large/1a5559b59d141e76dec3fe4b8780e5e3.png'],
+      ['toothlet', 'Toothlets', 'stats/dacc5e72286eb1d735cd00e38997512a.gif'],
     ]],
   ];
 
@@ -285,6 +289,8 @@
     charmMinQty: CHARM_MIN_QTY, // only luck charms held in quantities above this are used
     cannonRaid: 'enough',     // RaidBuster Cannonballs on raids: 'off' | 'always' | 'enough' (only with enough for the rest of the raid)
     cannonShip: false,        // RaidBuster Cannonballs during shipments
+    dentureBase: 'off',       // Signature Series Denture Base: 'off' | 'raid' | 'ship' (raids + shipments) | 'always'
+    toothletMin: 0,           // keep at least this many Toothlets (0 = use them all)
     dryRun: true,            // Pause: log decisions without acting (click the Pause button to go live)
     minimized: false,
     showSettings: false,      // panel sections folded until opened
@@ -318,6 +324,10 @@
   const rt = {
     busy: false,
     lastAction: 0,
+    cooldown: COOLDOWN_MS,
+    pending: false,   // an action just ran or is waiting out the cooldown: busy() stays on until a tick finds nothing to do
+    pendingSince: 0,  // start of the current chain of steps (busy() gives up after PENDING_MAX_MS)
+    chain: null,      // { lines } logged during the current chain, written as one entry when it ends
     backoff: {},        // kind -> timestamp until which that action is paused
     lastCraft: null,    // { which, before, at }
     tickTimer: null,
@@ -366,14 +376,53 @@
     }
   }
 
+  function splitLog(entry) {
+    const i = entry.indexOf('  ');
+    const time = i < 0 ? '' : entry.slice(0, i).replace(/\s*[AP]M$/i, '');
+    let msg = i < 0 ? entry : entry.slice(i + 2);
+    const m = msg.match(/ ×(\d+)$/);
+    if (m) msg = msg.slice(0, -m[0].length);
+    return { time, msg, count: m ? Number(m[1]) : 1 };
+  }
+
   function loadLog() {
     try { const l = JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); return Array.isArray(l) ? l.slice(0, LOG_MAX) : []; }
     catch (e) { return []; }
   }
 
+  // During a chain of steps (a raid start: base, weapon, charm, cannonballs…) lines are collected and written
+  // as one entry when the chain ends: the event as the headline, the rest on a second line. Warnings and
+  // errors are written at once.
   function log(msg, level) {
-    const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    rt.log.unshift(`${t}  ${msg}`);
+    if (rt.chain && level !== 'error' && !/^[✖⚠]/.test(msg)) {
+      rt.chain.lines.push(msg);
+      console.log(`[${SCRIPT}] ${msg}`);
+      return;
+    }
+    writeLog(msg, level);
+  }
+
+  // "Weapon: X Trap (Forgotten, …)" → "X Trap": the second line keeps names only (charms keep their luck).
+  const chainPart = (l) => l.replace(/^✔ /, '').replace(/^(Weapon|Base): (.*?)(?: \(.*\))?$/, '$2')
+    .replace(/^(Raid|Shipment) luck: /, '');
+
+  function flushChain() {
+    const c = rt.chain;
+    rt.chain = null;
+    if (!c || !c.lines.length) return;
+    if (c.lines.length === 1) { writeLog(c.lines[0]); return; }
+    const i = c.lines.findIndex((l) => /^[⚔⚓✈]/.test(l));
+    const head = i >= 0 ? c.lines[i] : c.lines[0];
+    const rest = c.lines.filter((l, j) => j !== (i >= 0 ? i : 0)).map(chainPart);
+    writeLog(`${head}\n${rest.join(' · ')}`);
+  }
+
+  // Entries are "HH:MM  message" (a second line after "\n"); the same message again folds into a count (×N).
+  function writeLog(msg, level) {
+    const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    const last = rt.log[0] ? splitLog(rt.log[0]) : null;
+    if (last && last.msg === msg) rt.log[0] = `${t}  ${msg} ×${last.count + 1}`;
+    else rt.log.unshift(`${t}  ${msg}`);
     if (rt.log.length > LOG_MAX) rt.log.length = LOG_MAX;
     try { localStorage.setItem(LOG_KEY, JSON.stringify(rt.log)); } catch (e) { /* storage unavailable */ }
     (level === 'error' ? console.warn : console.log)(`[${SCRIPT}] ${msg}`);
@@ -685,12 +734,25 @@
     if (want === null || want === s.fuelOn) return null;
     if (want && !s.canFuel) return null;
     if (ctx.backedOff('fuel') || !s.ui.fuelToggle) return null;
-    return { kind: 'fuel', label: `Turn RaidBuster Cannonballs ${want ? 'on' : 'off'}`, run: () => setFuel(want) };
+    return { kind: 'fuel', label: `Turn RaidBuster Cannonballs ${want ? 'on' : 'off'}`, done: `✔ Cannonballs ${want ? 'on' : 'off'}`, run: () => setFuel(want) };
   }
 
-  // ctx: { cfg, backedOff(kind), lastCraft, now, shipCharm, raids, weapon } (the live objects in tick(), fakes in tests).
+  // The trap step: base first (the Denture Base's luck changes the weapon and charm picks), then the weapon.
+  const trapStep = (s, ctx) => ctx.base.action(s) || ctx.weapon.action(s);
+
+  // ctx: { cfg, backedOff(kind), lastCraft, now, shipCharm, raids, weapon, base } (the live objects in tick(), fakes in tests).
+  // Whatever the stage decides, a decision without an action still gets the trap step (base, then weapon), so
+  // no branch (out of cheese, bait idle, backing off…) can leave the trap unchecked. Steps that depend on the
+  // trap (the shipment luck check, the raid charm) call trapStep themselves first.
   function decide(s, ctx) {
-    const { cfg, backedOff, shipCharm, raids, weapon } = ctx;
+    const p = stageDecision(s, ctx);
+    if (p.action) return p;
+    const trap = trapStep(s, ctx);
+    return trap ? doing(p.lead, trap) : p;
+  }
+
+  function stageDecision(s, ctx) {
+    const { cfg, backedOff, shipCharm, raids } = ctx;
     const lead = s.isIntercepting || raids.isActive() ? 'Raid' : s.inFlight ? 'In flight' : 'Docked';
     const fuel = fuelAction(s, ctx);
     if (s.isIntercepting) {
@@ -708,7 +770,7 @@
     if (s.inFlight) {
       const head = `${s.shipName || 'shipment'}, ${s.hunts} hunts left`;
       if (!cfg.autoBait) {
-        const wpn = weapon.action(s);
+        const wpn = trapStep(s, ctx);
         return wpn ? doing(lead, wpn) : decision(lead, `${head} (bait swap off)`);
       }
       const bait = shipmentBait(s, cfg);
@@ -716,7 +778,7 @@
       const capped = bait.capped(s.shipType, s.shipIntel);
       const full = capped ? ` · intel ${s.shipIntel}/${INTEL_CAP}, Swiss` : '';
       if (s.baitKey === want) {
-        const wpn = weapon.action(s);
+        const wpn = trapStep(s, ctx);
         if (wpn) return doing(lead, wpn);
         const luck = shipCharm.luckAction(s);
         if (luck) return doing(lead, luck);
@@ -793,10 +855,10 @@
   }
 
   function dockedBaitDecision(s, ctx, note, warn) {
-    const { cfg, backedOff, weapon } = ctx;
+    const { cfg, backedOff } = ctx;
     const parts = note ? [note] : [];
     const docked = (tail, w = warn) => decision('Docked', [...parts, tail].filter(Boolean).join(' · '), w);
-    const wpn = weapon.action(s);
+    const wpn = trapStep(s, ctx);
     if (!cfg.autoBait || cfg.dockedAction === 'none') return wpn ? doing('Docked', wpn) : docked('');
     if (backedOff('bait')) return docked('bait swap backing off', true);
     if (cfg.dockedAction === 'gouda' || cfg.dockedAction === 'superbrie') {
@@ -815,7 +877,7 @@
 
   // Intercepting a raid: raid setup, Bocconcini (armed or crafted), the weapon (Auto Trap), the raid charm.
   function raidDecision(s, ctx) {
-    const { cfg, raids, weapon } = ctx;
+    const { cfg, raids } = ctx;
     const r = s.raid;
     const head = `${r.name}, ${r.hunts} hunts left`;
     const init = raids.initAction(s);
@@ -829,7 +891,7 @@
       }
       return decision('Raid', `${head}, out of Bocconcini`);
     }
-    const wpn = weapon.action(s);
+    const wpn = trapStep(s, ctx);
     if (wpn) return doing('Raid', wpn);
     const step = raids.stepAction(s);
     if (step) return doing('Raid', step);
@@ -911,22 +973,35 @@
   const raidStore = loadRaidStore();
   let gearCache = null;
 
+  // The game's inventory reads as a promise of an item list: by class (with stats) or by item type.
+  function inventory(byClass, which) {
+    return new Promise((resolve, reject) => {
+      const UI = window.hg && window.hg.utils && window.hg.utils.UserInventory;
+      if (!UI) { reject(new Error('hg.utils.UserInventory not found')); return; }
+      const t = setTimeout(() => reject(new Error('inventory request timed out')), 10000);
+      const ok = (d) => { clearTimeout(t); resolve(Array.isArray(d) ? d : Object.values(d || {})); };
+      const fail = () => { clearTimeout(t); reject(new Error('inventory request failed')); };
+      if (byClass) UI.getItemsByClass(which, true, ok, fail);
+      else UI.getItems(which, ok, fail);
+    });
+  }
+
   async function getGear(force) {
     if (!force && gearCache && Date.now() - gearCache.at < 60000) return gearCache;
-    const UI = window.hg && window.hg.utils && window.hg.utils.UserInventory;
-    if (!UI) throw new Error('hg.utils.UserInventory not found');
-    const list = await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('inventory request timed out')), 10000);
-      UI.getItemsByClass(['weapon', 'trinket'], true,
-        (d) => { clearTimeout(t); resolve(Array.isArray(d) ? d : Object.values(d || {})); },
-        () => { clearTimeout(t); reject(new Error('inventory request failed')); });
-    });
+    const list = await inventory(true, ['weapon', 'trinket']);
     const weapons = list.filter((i) => i.classification === 'weapon' && toNum(i.quantity) > 0)
       .map((i) => ({ type: i.type, name: i.name, powerType: i.power_type_name, luck: toNum(i.luck), power: toNum(i.power) }));
     const charms = list.filter((i) => i.classification === 'trinket' && toNum(i.quantity) > 0)
       .map((i) => ({ type: i.type, name: i.name, luck: toNum(i.luck), qty: toNum(i.quantity) }));
     gearCache = { at: Date.now(), weapons, charms };
     return gearCache;
+  }
+
+  // Everything armed that a trap decision can depend on. Each module re-checks when this changes, so no
+  // module has to list (and risk forgetting) the parts it cares about.
+  function trapSignature() {
+    const u = window.user || {};
+    return `${u.weapon_name || ''}|${u.base_name || ''}|${u.bait_name || ''}|${u.trinket_name || ''}`;
   }
 
   function armedGear(gear) {
@@ -940,7 +1015,7 @@
 
   async function armGear(type, classification, name) {
     await goChain(trapControl().armItem(type, classification));
-    const field = classification === 'weapon' ? 'weapon_name' : 'trinket_name';
+    const field = { weapon: 'weapon_name', base: 'base_name' }[classification] || 'trinket_name';
     if (!(await waitFor(() => (window.user || {})[field] === name, 6000))) throw new Error(`${name} did not arm`);
     gearCache = null;
   }
@@ -1076,7 +1151,7 @@
 
   // One raid at a time: setup (the raid's luck charm, after Auto Trap has picked the weapon) → done, and the
   // charm comes off after the raid. The stored record also caches Minluck tool readings per raid and power type.
-  // Seams: storage { load, save }, gear { list() }, trap { weapon(), trinket(), powerType(), disarmCharm() },
+  // Seams: storage { load, save }, gear { list() }, trap { weapon(), trinket(), signature(), powerType(), disarmCharm() },
   // minluck (makeMinluck), luck { apply(minluck, gear, source) -> note }, plus config(), backedOff(kind), log(msg)
   // and onStart() (the raid takes over the charm).
   function makeRaid({ storage, gear, trap, minluck, luck, config, backedOff, log, onStart }) {
@@ -1110,6 +1185,7 @@
       const ml = cached != null ? { value: cached === 'inf' ? Infinity : cached, source: 'tool' } : cur;
       a.note = await luck.apply(ml.value, await gear.list(), ml.source);
       a.charmName = trap.trinket();
+      a.signature = trap.signature();
       a.phase = 'done';
       save();
       log(`✔ Raid luck: ${a.note}`);
@@ -1130,26 +1206,29 @@
       get note() { return store.active ? store.active.note || '' : ''; },
       isActive: () => !!store.active,
 
-      // Every tick: a finished setup re-checks the charm when you change the charm or weapon mid-raid.
+      // Every tick: a finished setup re-checks the charm when anything armed changed since it was picked
+      // (you swap the charm or weapon, Auto Base takes the Denture off when the Toothlets run out…).
       sync(s) {
         const a = s.isIntercepting && activeFor(s.raid.name);
         if (!a || a.phase !== 'done') return;
-        const charmGone = a.charmName && trap.trinket() !== a.charmName;
-        const weaponChanged = a.weaponName && trap.weapon() !== a.weaponName;
-        if (charmGone || weaponChanged) { a.phase = 'charm'; save(); }
+        // A raid set up by an older version has no signature: check its charm once against the current trap.
+        if (!a.signature || trap.signature() !== a.signature) {
+          a.phase = 'charm';
+          save();
+        }
       },
 
       // Intercepting a raid this module isn't tracking yet.
       initAction(s) {
         if (activeFor(s.raid.name)) return null;
-        return { kind: 'raid', label: `Raid setup (${s.raid.name})`, run: async () => init(s.raid) };
+        return { kind: 'raid', label: `Raid setup (${s.raid.name})`, done: '', run: async () => init(s.raid) };
       },
 
       // The charm step while the setup isn't done.
       stepAction(s) {
         const a = activeFor(s.raid.name);
         if (!a || a.phase === 'done' || backedOff('raid')) return null;
-        return { kind: 'raid', label: `Raid charm (${s.raid.name})`, run: () => charmStep(s.raid, a) };
+        return { kind: 'raid', label: `Raid charm (${s.raid.name})`, done: '', run: () => charmStep(s.raid, a) };
       },
 
       restore,
@@ -1161,6 +1240,7 @@
     gear: { list: () => getGear(true) },
     trap: {
       weapon: () => (window.user || {}).weapon_name,
+      signature: () => trapSignature(),
       trinket: () => (window.user || {}).trinket_name || null,
       powerType: () => (window.user || {}).trap_power_type_name,
       disarmCharm: () => disarmCharm(),
@@ -1180,7 +1260,7 @@
 
   // Only a ship charm is ever swapped or removed on shipments; any other charm is yours. `charm` is the
   // armed ship charm, `pending` the one being armed (an arm that times out but lands later is still ours).
-  // Seams: storage { load, save }, trap { trinket, setupKey, disarm }, luck { apply(onArm) -> note },
+  // Seams: storage { load, save }, trap { trinket, signature, disarm }, luck { apply(onArm) -> note },
   // plus config(), raidActive(), backedOff(kind) and log(msg).
   function makeShipCharm({ storage, trap, luck, config, raidActive, backedOff, log }) {
     const own = Object.assign({ charm: null, pending: null }, storage.load());
@@ -1194,7 +1274,7 @@
       own.charm = own.pending = null;
       save();
     }
-    const setupKey = (s) => `${s.shipType}|${trap.setupKey()}`;
+    const setupKey = (s) => `${s.shipType}|${trap.signature()}`;
     // 'always', or 'bocconcini' only while Aurora Bocconcini is the armed bait.
     const wanted = (s) => config().luckCharmsNormal === 'always'
       || (config().luckCharmsNormal === 'bocconcini' && s.baitKey === 'bocconcini');
@@ -1248,7 +1328,7 @@
       // In flight with the right bait armed: a luck check when wanted and the setup changed since the last one.
       luckAction(s) {
         if (!wanted(s) || checkedKey === setupKey(s) || backedOff('luck')) return null;
-        return { kind: 'luck', label: 'Luck check (shipment)', run: () => luckStep(s) };
+        return { kind: 'luck', label: 'Luck check (shipment)', done: '', run: () => luckStep(s) };
       },
     };
   }
@@ -1276,10 +1356,7 @@
     },
     trap: {
       trinket: () => (window.user || {}).trinket_name || null,
-      setupKey: () => {
-        const u = window.user || {};
-        return `${u.weapon_name}|${u.base_name}|${u.bait_name}|${u.trinket_name || ''}`;
-      },
+      signature: () => trapSignature(),
       disarm: () => disarmCharm(),
     },
     luck: {
@@ -1302,7 +1379,7 @@
   // mice drop on every catch (without one, the luckiest Law weapon). Role 'law' while Swiss, Romano or Bocconcini
   // is armed: Skyport shipment mice are all Law. Role 'raid' while intercepting: the raid location's allowed
   // power types, the luckiest weapon that reaches minluck with the best raid charm (else the luckiest).
-  // Seams: gear { list(), armed(gear) }, trap { weapon(), powerType(), arm(type, classification, name) },
+  // Seams: gear { list(), armed(gear) }, trap { weapon(), signature(), powerType(), arm(type, classification, name) },
   // minluck (makeMinluck), cache { get(key), set(key, minluck) } for Minluck tool readings per raid and type,
   // plus config(), charmMin(), backedOff(kind), log(msg).
   function makeWeapon({ gear, trap, minluck, cache, config, charmMin, backedOff, log }) {
@@ -1352,12 +1429,13 @@
           v = await minluck.readTool();
           cache.set(`${raid.name}|${w.powerType}`, v);
         }
-        if (baseLuck + w.luck + topCharm >= v) return { weapon: w, reason: `${w.powerType} raid, reaches minluck ${v}` };
+        if (baseLuck + w.luck + topCharm >= v) return { weapon: w, reason: `${w.powerType}, reaches minluck ${v}` };
       }
-      return { weapon: best[0], reason: `${best[0].powerType} raid, luckiest (minluck out of reach)` };
+      return { weapon: best[0], reason: `${best[0].powerType}, luckiest, minluck out of reach` };
     }
 
-    const key = (r, s) => `${r === 'raid' ? `raid:${s.raid.name}` : r}|${trap.weapon()}`;
+    // Role (+ raid) and the trap signature: a raid pick depends on the other luck too (base, charm).
+    const key = (r, s) => `${r === 'raid' ? `raid:${s.raid.name}` : r}|${trap.signature()}`;
 
     async function check(r, s) {
       const g = await gear.list();
@@ -1384,7 +1462,7 @@
       action(s) {
         const r = role(s);
         if (!r || checkedKey === key(r, s) || backedOff('weapon')) return null;
-        return { kind: 'weapon', label: LABELS[r], run: () => check(r, s) };
+        return { kind: 'weapon', label: LABELS[r], done: '', run: () => check(r, s) };
       },
     };
   }
@@ -1393,6 +1471,7 @@
     gear: { list: () => getGear(true), armed: (g) => armedGear(g) },
     trap: {
       weapon: () => (window.user || {}).weapon_name,
+      signature: () => trapSignature(),
       powerType: () => (window.user || {}).trap_power_type_name,
       arm: (type, classification, name) => armGear(type, classification, name),
     },
@@ -1403,6 +1482,163 @@
     },
     config: () => cfg,
     charmMin: () => charmMin(),
+    backedOff: (kind) => backedOff(kind),
+    log: (msg) => log(msg),
+  });
+
+  /* ------------------------------------------------------------------ *
+   * Auto Base: the Signature Series Denture Base while Toothlets last
+   * ------------------------------------------------------------------ */
+  const BASE_KEY = 'mhCeruleanSkyport.base.v1';
+  const DENTURE = { type: 'upgraded_denture_base', name: 'Signature Series Denture Base', short: 'Denture Base',
+    charge: 'fulmina_charged_tooth_stat_item' };
+
+  // The Denture Base has 3,750 power and 50 luck while any Ful'mina's Charged Toothlet is held (one decays per
+  // catch). cfg.dentureBase says when: 'raid', 'ship' (raids + shipments) or 'always'. The base it replaces is
+  // remembered (`prev`) and armed again when the Denture is no longer wanted. Only a Denture this script armed
+  // is ever taken off; `pending` marks an arm in progress (one that times out but lands later is still ours).
+  // Seams: storage { load, save }, gear { charge() -> { owned, toothlets }, bases() -> [{ type, name, luck }] },
+  // trap { base(), signature(), arm(type, name) }, plus config(), backedOff(kind), log(msg).
+  function makeBase({ storage, gear, trap, config, backedOff, log }) {
+    // `yielded`: the stage in which you swapped the Denture off yourself; Auto Base waits for the next stage.
+    const own = Object.assign({ prev: null, ours: false, pending: false, yielded: null }, storage.load());
+    const save = () => storage.save({ prev: own.prev, ours: own.ours, pending: own.pending, yielded: own.yielded });
+    let owned = null;       // Denture owned (null = not read yet)
+    let toothlets = null;   // last Toothlet count read
+    let hunt = 0;           // bumped on every horn: one check per hunt catches the Toothlets running out
+    let checkedKey = null;
+    const warned = new Set();
+
+    const mode = () => config().dentureBase || 'off';
+    const min = () => Math.max(0, toNum(config().toothletMin));
+    const covers = (s) => (mode() === 'always') || (mode() === 'ship' && (s.isIntercepting || s.inFlight))
+      || (mode() === 'raid' && s.isIntercepting);
+    const stage = (s) => (s.isIntercepting ? 'raid' : s.inFlight ? 'ship' : 'docked');
+    const key = (s) => `${mode()}|${stage(s)}|${min()}|${trap.signature()}|${hunt}`;
+
+    function release() {
+      own.prev = null;
+      own.yielded = null;
+      own.ours = own.pending = false;
+      save();
+    }
+
+    // Why the Denture is not wanted (for the log), or '' when it is.
+    function why(s) {
+      if (mode() === 'off') return 'Auto Base off';
+      if (!covers(s)) return s.isIntercepting ? 'raid' : s.inFlight ? 'shipment' : 'docked';
+      if (!owned) return 'not owned';
+      if (toothlets <= 0) return 'out of Toothlets';
+      if (toothlets <= min()) return `Toothlets at minimum (${min()})`;
+      return '';
+    }
+
+    async function check(s) {
+      const c = await gear.charge();
+      owned = c.owned;
+      toothlets = c.toothlets;
+      const armed = trap.base();
+      if (own.pending) {          // an arm that never confirmed: ours only if it landed
+        own.ours = armed === DENTURE.name;
+        own.pending = false;
+        if (!own.ours) own.prev = null;
+        save();
+      }
+      if (own.ours && armed !== DENTURE.name) {
+        log(`Base: you armed ${armed}, Auto Base leaves it this ${stage(s) === 'ship' ? 'shipment' : stage(s)}`);
+        release();
+        own.yielded = stage(s);
+        save();
+      }
+      if (own.yielded && own.yielded !== stage(s)) { own.yielded = null; save(); }
+      const reason = why(s) || (own.yielded ? 'you chose another base' : '');
+      if (!reason && armed !== DENTURE.name) {
+        own.prev = armed ? { type: ((await gear.bases()).find((b) => b.name === armed) || {}).type || null, name: armed } : null;
+        own.pending = true;
+        save();
+        await trap.arm(DENTURE.type, DENTURE.name);
+        own.ours = true;
+        own.pending = false;
+        save();
+        log(`✔ Base: ${DENTURE.short} (${toothlets.toLocaleString()} Toothlets)`);
+      } else if (reason && own.ours) {
+        const bases = (await gear.bases()).filter((b) => b.type !== DENTURE.type);
+        let back = own.prev && bases.find((b) => b.type === own.prev.type || b.name === own.prev.name);
+        let note = '';
+        if (!back) {
+          back = bases.slice().sort((a, b) => b.luck - a.luck)[0];
+          note = own.prev ? `, ${own.prev.name} not owned` : '';
+        }
+        if (back) await trap.arm(back.type, back.name);
+        release();
+        log(`✔ Base: ${back ? back.name : 'none'} back (${reason}${note})`);
+      } else if (mode() !== 'off' && covers(s) && owned === false && !warned.has('owned')) {
+        warned.add('owned');
+        log(`Auto Base: no ${DENTURE.name} owned, base left alone`);
+      }
+      checkedKey = key(s);
+    }
+
+    return {
+      get toothlets() { return toothlets; },
+      get owned() { return owned; },
+      noteHunt() { hunt++; },
+
+      // Toothlet count for the panel, read without touching the trap (also while Auto Base is off).
+      async refresh() {
+        try { const c = await gear.charge(); owned = c.owned; toothlets = c.toothlets; } catch (e) { /* next hunt */ }
+      },
+
+      // One line under the Base setting: Toothlets left and the base the Denture gives way to.
+      hint() {
+        if (mode() === 'off') return '';
+        if (owned === false) return `You don't own the ${DENTURE.name}.`;
+        const n = toothlets == null ? '? Toothlets' : toothlets <= 0 ? 'No Toothlets'
+          : `${toothlets.toLocaleString()} Toothlets${toothlets <= min() ? ' (at minimum)' : ''}`;
+        const armed = trap.base();
+        if (!own.ours && armed === DENTURE.name) return `${n} · You armed the Denture yourself: left on.`;
+        // Plain words for a new player: when the Denture goes on, and which base comes back after.
+        const other = own.ours ? (own.prev ? own.prev.name : 'your luckiest base') : armed || 'your base';
+        const when = { raid: 'Swaps in for raids', ship: 'Swaps in for raids and shipments',
+          always: 'Stays on until the Toothlets run out' }[mode()];
+        return `${n} · ${when}, then back to ${other}.`;
+      },
+
+      action(s) {
+        if (mode() === 'off' && !own.ours && !own.pending) return null;
+        if (checkedKey === key(s) || backedOff('base')) return null;
+        return { kind: 'base', label: 'Base check', done: '', run: () => check(s) };
+      },
+    };
+  }
+
+  const base = makeBase({
+    storage: {
+      load() {
+        try { const d = JSON.parse(localStorage.getItem(BASE_KEY) || 'null'); if (d && typeof d === 'object') return d; } catch (e) { /* corrupt or unavailable */ }
+        return {};
+      },
+      save(d) {
+        try { localStorage.setItem(BASE_KEY, JSON.stringify(d)); } catch (e) { /* storage unavailable */ }
+      },
+    },
+    gear: {
+      async charge() {
+        const list = await inventory(false, [DENTURE.type, DENTURE.charge]);
+        const qty = (type) => toNum((list.find((i) => i.type === type) || {}).quantity);
+        return { owned: qty(DENTURE.type) > 0, toothlets: qty(DENTURE.charge) };
+      },
+      async bases() {
+        return (await inventory(true, ['base'])).filter((i) => i.classification === 'base' && toNum(i.quantity) > 0)
+          .map((i) => ({ type: i.type, name: i.name, luck: toNum(i.luck) }));
+      },
+    },
+    trap: {
+      base: () => (window.user || {}).base_name || null,
+      signature: () => trapSignature(),
+      arm: (type, name) => armGear(type, 'base', name),
+    },
+    config: () => cfg,
     backedOff: (kind) => backedOff(kind),
     log: (msg) => log(msg),
   });
@@ -1545,6 +1781,8 @@
 
   async function runAction(kind, label, fn, done) {
     rt.busy = true;
+    if (!rt.pending) { rt.pendingSince = Date.now(); flushChain(); rt.chain = { lines: [] }; }
+    rt.pending = true;
     rt.lastAction = Date.now();
     try {
       await fn();
@@ -1562,8 +1800,9 @@
     } finally {
       rt.busy = false;
       rt.lastAction = Date.now();
+      rt.cooldown = QUICK_KINDS.has(kind) && !rt.backoff[kind] ? QUICK_COOLDOWN_MS : COOLDOWN_MS;
       updateUI();
-      scheduleTick(COOLDOWN_MS + 200);
+      scheduleTick(rt.cooldown + 200);
     }
   }
 
@@ -1654,21 +1893,29 @@
   async function tick() {
     rt.tickTimer = null;
     if (rt.busy) return;
+    const wasPending = rt.pending;
+    rt.pending = false;
     try {
       const u = window.user;
       if (!u) { rt.status = { kind: 'idle', lead: 'Waiting for game…', detail: '' }; return; }
       const s = readState();
-      if (!s) { rt.status = { kind: 'idle', lead: 'Not at Cerulean Skyport', detail: 'travel there to use the autopilot' }; return; }
+      if (!s) { flushChain(); rt.status = { kind: 'idle', lead: 'Not at Cerulean Skyport', detail: 'travel there to use the autopilot' }; return; }
       try { trackEvents(s, u); } catch (e) { console.warn(`[${SCRIPT}] events`, e); }
       shipCharm.sync();
       raids.sync(s);
-      if (u.has_puzzle) { rt.status = { kind: 'err', lead: "King's Reward", detail: 'paused until it is solved' }; return; }
+      if (u.has_puzzle) { flushChain(); rt.status = { kind: 'err', lead: "King's Reward", detail: 'paused until it is solved' }; return; }
 
-      const wait = COOLDOWN_MS - (Date.now() - rt.lastAction);
-      if (wait > 0) { scheduleTick(wait + 100); return; }
-
-      const p = decide(s, { cfg, backedOff, lastCraft: rt.lastCraft, now: Date.now(), shipCharm, raids, weapon });
+      const wait = rt.cooldown - (Date.now() - rt.lastAction);
+      if (wait > 0) {
+        // Waiting out the gap after a step: keep busy() on so the horn waits for the next step, if any.
+        rt.pending = wasPending && !cfg.dryRun;
+        if (rt.chain && Date.now() - rt.pendingSince > PENDING_MAX_MS) flushChain();
+        scheduleTick(wait + 100);
+        return;
+      }
+      const p = decide(s, { cfg, backedOff, lastCraft: rt.lastCraft, now: Date.now(), shipCharm, raids, weapon, base });
       rt.status = planStatus(p, cfg.dryRun);
+      if (!p.action || cfg.dryRun) flushChain();   // the chain of steps is over
       if (p.action && !cfg.dryRun) {
         updateUI();
         await runAction(p.action.kind, p.action.label, p.action.run, p.action.done);
@@ -1707,7 +1954,7 @@
 #${PANEL_ID} .mhcs-dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--c,var(--idle));transform:translateY(-1px);box-shadow:0 0 0 3px color-mix(in srgb,var(--c,var(--idle)) 18%,transparent);}
 #${PANEL_ID}.mhcs-away .mhcs-body > :not(.mhcs-status){display:none;}
 #${PANEL_ID}.mhcs-away .mhcs-status{margin-bottom:0;}
-#${PANEL_ID} .mhcs-group{color:#8b93a3;font-size:11px;margin-top:5px;}
+#${PANEL_ID} .mhcs-group{color:#9ecbff;font-size:11px;font-weight:600;margin-top:7px;}
 #${PANEL_ID} .mhcs-res{display:grid;grid-template-columns:repeat(2,1fr);gap:2px 10px;margin:2px 0;}
 #${PANEL_ID} .mhcs-res span{display:flex;align-items:center;gap:5px;}
 #${PANEL_ID} .mhcs-res img{width:16px;height:16px;border-radius:3px;object-fit:contain;}
@@ -1721,10 +1968,24 @@
 #${PANEL_ID} label.mhcs-stack select{max-width:none;width:100%;}
 #${PANEL_ID} .mhcs-reset{display:block;margin:8px 0 0 auto;background:none;border:0;padding:0;color:#8b93a3;font:inherit;font-size:11px;text-decoration:underline;cursor:pointer;}
 #${PANEL_ID} .mhcs-reset:hover,#${PANEL_ID} .mhcs-reset.mhcs-armed{color:var(--err);}
-#${PANEL_ID} label.mhcs-bocc{display:none;}
-#${PANEL_ID}.mhcs-show-bocc label.mhcs-bocc{display:flex;}
+#${PANEL_ID} .mhcs-line{display:flex;align-items:center;gap:6px;margin:3px 0;}
+#${PANEL_ID} .mhcs-line label{margin:0;}
+#${PANEL_ID} .mhcs-line select{flex:1;min-width:0;max-width:none;}
+#${PANEL_ID} .mhcs-lbl{flex:none;width:62px;}
+#${PANEL_ID} .mhcs-lbl.mhcs-gap{width:auto;}
+#${PANEL_ID} .mhcs-gap{margin-left:4px;}
+#${PANEL_ID} .mhcs-grow{flex:1;min-width:0;margin:0;}
+#${PANEL_ID} .mhcs-lbl.mhcs-gap{margin-left:0;}
+#${PANEL_ID} .mhcs-mini{flex:none;display:flex;align-items:center;gap:4px;color:#aab2c0;}
+#${PANEL_ID} .mhcs-mini input[type=number]{width:42px;}
+#${PANEL_ID} .mhcs-res3{display:grid;grid-template-columns:repeat(3,1fr);gap:0 8px;}
+#${PANEL_ID} .mhcs-res3 label{flex-direction:column;align-items:stretch;gap:2px;margin:0;font-size:11px;color:#aab2c0 !important;}
+#${PANEL_ID} .mhcs-res3 input[type=number]{width:100%;}
+#${PANEL_ID} .mhcs-bocc,#${PANEL_ID} .mhcs-base{display:none !important;}
+#${PANEL_ID}.mhcs-show-bocc .mhcs-bocc,#${PANEL_ID}.mhcs-show-base .mhcs-mini.mhcs-base{display:flex !important;}
+#${PANEL_ID}.mhcs-show-base .mhcs-hint.mhcs-base{display:block !important;}
 #${PANEL_ID} .mhcs-hint{color:#8b93a3;font-size:11px;line-height:1.35;margin:2px 0 4px;}
-#${PANEL_ID} .mhcs-subhead{color:#8b93a3;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;margin:8px 0 2px;}
+#${PANEL_ID} .mhcs-subhead{color:#9ecbff;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;margin:10px 0 4px;padding-bottom:2px;border-bottom:1px solid #303747;}
 #${PANEL_ID} .mhcs-subhead:first-of-type{margin-top:4px;}
 #${PANEL_ID} .mhcs-pause{flex:none;margin-right:6px;padding:1px 8px;height:20px;border-radius:999px;cursor:pointer;font:600 11px/16px -apple-system,Segoe UI,Roboto,Arial,sans-serif;white-space:nowrap;border:1px solid var(--pause);background:color-mix(in srgb,var(--pause) 18%,transparent);color:var(--pause);}
 #${PANEL_ID}.mhcs-is-paused .mhcs-hstate{display:none;}
@@ -1736,9 +1997,14 @@
 #${PANEL_ID} select{max-width:165px;}
 #${PANEL_ID} input[type=number]{width:70px;}
 #${PANEL_ID} .mhcs-tip{position:absolute;left:8px;right:8px;z-index:3;display:none;pointer-events:none;background:#0d1117;color:#e6e9ef;border:1px solid #3a4150;border-radius:6px;padding:6px 8px;font-size:11px;line-height:1.4;box-shadow:0 4px 12px rgba(0,0,0,.5);}
-#${PANEL_ID} summary{cursor:pointer;color:#8b93a3;user-select:none;}
-#${PANEL_ID} summary:hover{color:#e6e9ef;}
-#${PANEL_ID} .mhcs-log{margin-top:4px;max-height:180px;overflow-y:auto;font:11px/1.35 Consolas,monospace;color:#aab2c0;white-space:pre-wrap;word-break:break-word;}
+#${PANEL_ID} summary{cursor:pointer;color:#e6e9ef;font-weight:600;font-size:12.5px;user-select:none;padding:2px 0;}
+#${PANEL_ID} summary:hover{color:#9ecbff;}
+#${PANEL_ID} .mhcs-sub{color:#8b93a3;font-size:11px;margin-top:1px;}
+#${PANEL_ID} .mhcs-log{margin-top:4px;max-height:220px;overflow-y:auto;font-size:11.5px;line-height:1.4;color:#c9d1d9;}
+#${PANEL_ID} .mhcs-ent{display:grid;grid-template-columns:36px 1fr;gap:6px;padding:4px 2px;border-bottom:1px solid #262c38;word-break:break-word;}
+#${PANEL_ID} .mhcs-ent:last-child{border-bottom:0;}
+#${PANEL_ID} .mhcs-t{color:#6e7681;font-variant-numeric:tabular-nums;}
+#${PANEL_ID} .mhcs-warn{color:#e3b341;}
 `;
 
   const TOGGLES = [
@@ -1765,45 +2031,55 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
   </div>
   <details class="mhcs-sec" data-fold="showSettings"><summary>Settings</summary>
     <div class="mhcs-subhead">Bait</div>
-    <label class="mhcs-stack"><span>Shipment bait</span>
+    <div class="mhcs-line" data-tip="Cheese on shipments."><span class="mhcs-lbl">Shipment</span>
       <select data-c="spiceMode">
-        <option value="swiss">Sky Pirate Swiss</option>
-        <option value="romano">Sky Raider Romano</option>
-        <option value="bocconcini">Aurora Bocconcini</option>
-        <option value="bocconcini_spice">Aurora Bocconcini (Spice only)</option>
-      </select></label>
+        <option value="swiss">Swiss</option>
+        <option value="romano">Romano</option>
+        <option value="bocconcini">Bocconcini</option>
+        <option value="bocconcini_spice">Bocc. on Spice</option>
+      </select><span class="mhcs-mini mhcs-bocc" data-tip="Bocconcini kept for raids (a raid needs ${RAID_MIN_BOCCONCINI}). 0 = none.">Min <input type="number" min="0" step="1" data-c="boccMin"></span></div>
     <div class="mhcs-hint" data-f="baitHint"></div>
-    <label class="mhcs-row mhcs-bocc" data-tip="Keep some for raids (a raid needs ${RAID_MIN_BOCCONCINI}). 0 = none."><span>Min Bocconcini to keep</span> <input type="number" min="0" step="1" data-c="boccMin"></label>
-    <label class="mhcs-stack" data-tip="Gouda and SUPER|brie+ farm Corsair's Curds."><span>Docked bait</span>
+    <div class="mhcs-line" data-tip="Gouda and SUPER|brie+ farm Corsair's Curds."><span class="mhcs-lbl">Docked</span>
       <select data-c="dockedAction">
         <option value="gouda">Gouda</option>
         <option value="superbrie">SUPER|brie+</option>
         <option value="disarm">Disarm</option>
         <option value="none">Leave as-is</option>
-      </select></label>
+      </select></div>
+    <div class="mhcs-subhead">Base</div>
+    <div class="mhcs-line" data-tip="Signature Series Denture Base: 3,750 power, 50 luck while you hold Toothlets (one used per catch)."><span class="mhcs-lbl">Denture</span>
+      <select data-c="dentureBase">
+        <option value="off">Off</option>
+        <option value="raid">Raids only</option>
+        <option value="ship">Raids and shipments</option>
+        <option value="always">Every hunt</option>
+      </select><span class="mhcs-mini mhcs-base" data-tip="Toothlets to keep. At or below it, your old base goes back on. 0 = none.">Min <input type="number" min="0" step="1" data-c="toothletMin"></span></div>
+    <div class="mhcs-hint mhcs-base" data-f="baseHint"></div>
     <div class="mhcs-subhead">Luck Charms</div>
-    <label data-tip="Closes the gap to minluck. Removed after the raid."><input type="checkbox" data-c="luckCharmsRaid"> Luck charms on raids</label>
-    <label class="mhcs-stack" data-tip="Only with Bocconcini: removed when another bait goes on."><span>Luck charms on shipments</span>
+    <label class="mhcs-line" data-tip="Closes the gap to minluck. Removed after the raid."><span class="mhcs-lbl">Raids</span><input type="checkbox" data-c="luckCharmsRaid"></label>
+    <div class="mhcs-line" data-tip="With Bocconcini: removed when another bait goes on."><span class="mhcs-lbl">Shipments</span>
       <select data-c="luckCharmsNormal">
         <option value="off">Off</option>
-        <option value="bocconcini">Only with Bocconcini</option>
+        <option value="bocconcini">With Bocconcini</option>
         <option value="always">Always</option>
-      </select></label>
-    <label class="mhcs-row" data-tip="Only charms you hold more of. 0 = any."><span>Min charms to use</span> <input type="number" min="0" step="1" data-c="charmMinQty"></label>
+      </select></div>
+    <div class="mhcs-line" data-tip="Only charms you hold more of. 0 = any."><span class="mhcs-lbl">Min held</span><input type="number" min="0" step="1" data-c="charmMinQty"></div>
     <div class="mhcs-subhead">Cannonballs</div>
-    <label class="mhcs-stack" data-tip="Only with enough: one per raid hunt left. Off: switch left alone."><span>Cannonballs on raids</span>
+    <div class="mhcs-line" data-tip="Enough: only when you hold one per raid hunt left. Always: while any are left. Off: switch left alone."><span class="mhcs-lbl">Raids</span>
       <select data-c="cannonRaid">
         <option value="off">Off</option>
-        <option value="enough">Only with enough (25+)</option>
+        <option value="enough">Enough</option>
         <option value="always">Always</option>
-      </select></label>
-    <label data-tip="While you have any."><input type="checkbox" data-c="cannonShip"> Cannonballs on shipments</label>
+      </select></div>
+    <label class="mhcs-line" data-tip="While you have any."><span class="mhcs-lbl">Shipments</span><input type="checkbox" data-c="cannonShip"></label>
     <div class="mhcs-subhead">Crafting</div>
     <label data-tip="2 cheese per craft; Gold when out. Off: Gold only."><input type="checkbox" data-c="craftEssence"> Use Magic Essence (Recommended)</label>
     <div class="mhcs-subhead">Reserves</div>
-    <label class="mhcs-row" data-tipfor="minDebris"><span>Min Debris</span> <input type="number" min="0" step="1" data-c="minDebris"></label>
-    <label class="mhcs-row" data-tipfor="minGas"><span>Min Gas</span> <input type="number" min="0" step="1" data-c="minGas"></label>
-    <label class="mhcs-row" data-tipfor="minCloudstone"><span>Min Cloudstone</span> <input type="number" min="0" step="1" data-c="minCloudstone"></label>
+    <div class="mhcs-res3">
+      <label data-tipfor="minDebris"><span>Debris</span><input type="number" min="0" step="1" data-c="minDebris"></label>
+      <label data-tipfor="minGas"><span>Gas</span><input type="number" min="0" step="1" data-c="minGas"></label>
+      <label data-tipfor="minCloudstone"><span>Cloudstone</span><input type="number" min="0" step="1" data-c="minCloudstone"></label>
+    </div>
     <button class="mhcs-reset" type="button" data-a="reset" data-tip="Every setting, Pause too. Click twice.">Reset to defaults</button>
   </details>
   <details class="mhcs-sec" data-fold="showLog"><summary>Log</summary><div class="mhcs-log" data-f="log"></div></details>
@@ -1893,7 +2169,9 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
     // Spells out which cheese each shipment gets, including the fallback to Swiss.
     const showBaitMode = () => {
       panel.classList.toggle('mhcs-show-bocc', !!baitMode().useMin);
+      panel.classList.toggle('mhcs-show-base', (cfg.dentureBase || 'off') !== 'off');
       panel.querySelector('[data-f="baitHint"]').textContent = baitMode().hint;
+      panel.querySelector('[data-f="baseHint"]').textContent = base.hint();
     };
     const syncInputs = () => {
       for (const el of panel.querySelectorAll('[data-c]')) {
@@ -1977,22 +2255,46 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
     if (!panel) return;
     const set = (f, v) => { const el = panel.querySelector(`[data-f="${f}"]`); if (el) el.textContent = v; };
     renderStatus();
-    set('log', rt.log.join('\n'));
+    const box = panel.querySelector('[data-f="log"]');
+    box.textContent = '';
+    for (const entry of rt.log) {
+      const { time, msg, count } = splitLog(entry);
+      const row = document.createElement('div');
+      row.className = `mhcs-ent${/^[✖⚠]/.test(msg) ? ' mhcs-warn' : ''}`;
+      const tm = document.createElement('span');
+      tm.className = 'mhcs-t';
+      tm.textContent = time;
+      const tx = document.createElement('span');
+      const [head, sub] = msg.split('\n');
+      tx.textContent = count > 1 ? `${head} ×${count}` : head;
+      if (sub) {
+        const d = document.createElement('div');
+        d.className = 'mhcs-sub';
+        d.textContent = sub;
+        tx.appendChild(d);
+      }
+      row.append(tm, tx);
+      box.appendChild(row);
+    }
     refreshTips(readState());
 
     const s = readState();
     panel.classList.toggle('mhcs-away', !s);   // away from Cerulean Skyport: status line only
     if (!s) return;
+    set('baseHint', base.hint());
 
     const low = {
       debris: s.debris < toNum(cfg.minDebris),
       gas: s.gas < toNum(cfg.minGas),
       cloudstone: s.cloudstone < toNum(cfg.minCloudstone),
       swiss: s.swiss < MIN_SWISS,
+      toothlet: cfg.dentureBase !== 'off' && base.toothlets != null && base.toothlets <= toNum(cfg.toothletMin),
     };
     for (const el of panel.querySelectorAll('[data-r]')) {
       const k = el.dataset.r;
-      el.textContent = Number(s[k] || 0).toLocaleString();
+      if (k === 'toothlet') el.parentNode.style.display = base.owned === false ? 'none' : '';
+      const v = k === 'toothlet' ? base.toothlets : s[k];
+      el.textContent = v == null ? '?' : Number(v || 0).toLocaleString();
       el.classList.toggle('mhcs-low', !!low[k]);
     }
   }
@@ -2007,6 +2309,7 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
     if ($ && $.fn) {
       $(document).ajaxComplete((ev, xhr, settings) => {
         const url = (settings && settings.url) || '';
+        if (/turn\.php/i.test(url)) { base.noteHunt(); if (cfg.dentureBase === 'off' && cfg.showResources) base.refresh(); }
         if (/turn\.php|changetrap\.php/i.test(url)) scheduleTick(1500);
         else if (/skyport|cerulean|craft|convert|page\.php/i.test(url)) scheduleTick(2500);
         updateUI();
@@ -2015,11 +2318,13 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
       log('jQuery not found, relying on heartbeat only', 'error');
     }
 
+    base.refresh().then(updateUI);
+    window.addEventListener('pagehide', () => flushChain());   // a reload mid-chain keeps its lines
     setInterval(() => { if (!rt.tickTimer) tick(); }, HEARTBEAT_MS);
     scheduleTick(2000);
 
     // Console handle: mhSkyport.state(), mhSkyport.tick(). busy() is read by the Auto Horn script.
-    window.mhSkyport = { state: readState, tick: () => scheduleTick(0), busy: () => rt.busy, config: cfg, raid: () => raids.store, readMinluck, currentMinluck: () => minluck.current((window.user || {}).trap_power_type_name), builtinMinluck };
+    window.mhSkyport = { state: readState, tick: () => scheduleTick(0), busy: () => rt.busy || (rt.pending && Date.now() - rt.pendingSince < PENDING_MAX_MS), config: cfg, raid: () => raids.store, readMinluck, currentMinluck: () => minluck.current((window.user || {}).trap_power_type_name), builtinMinluck };
     console.log(`[${SCRIPT}] Loaded`);
   }
 
