@@ -2,7 +2,7 @@
 // @name         MouseHunt Auto Disarm/Swap Bait (Kane)
 // @author       Kane
 // @namespace    https://greasyfork.org/en/users/979741
-// @version      5.5
+// @version      5.6
 // @description  Disarms your trap or swaps to the cheese you choose when your bait drops to a set quantity. Waits for confirmation, retries if the game refuses, and pauses during King's Rewards. Pairs with MouseHunt Auto Horn & KR Solver (Kane) and Cerulean Skyport Autopilot (Kane).
 // @match        https://mousehuntgame.com/*
 // @match        https://www.mousehuntgame.com/*
@@ -130,6 +130,13 @@
         if (u.has_puzzle) { setWarning("Waiting: King's Reward"); return; }
         // Don't change the trap while the Cerulean Skyport Autopilot is mid-action.
         try { if (window.mhSkyport?.busy?.()) return; } catch (e) { /* ignore */ }
+        // At Cerulean Skyport the Autopilot's Auto Bait owns the bait (it would re-arm right after a swap).
+        // Without the Autopilot, away from Skyport, with Auto Bait off or the Autopilot paused: works as usual.
+        const sky = window.mhSkyport?.config;
+        if (u.environment_type === 'cerulean_skyport' && sky?.autoBait && !sky.dryRun) {
+            setWarning('Skyport Autopilot manages bait here');
+            return;
+        }
 
         const currentQty = getCurrentBaitQuantity();
         const currentID = getCurrentBaitID();
