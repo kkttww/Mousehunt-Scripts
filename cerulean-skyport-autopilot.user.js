@@ -2,7 +2,7 @@
 // @name         MouseHunt Cerulean Skyport Autopilot (Kane)
 // @namespace    https://greasyfork.org/en/users/979741
 // @version      1.0.5
-// @description  Runs Cerulean Skyport for you: launches airship shipments, swaps bait, crafts Sky Pirate Swiss and Aurora Bocconcini, picks your weapon and luck charms, and starts raids. Starts paused so you can check its plan first. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
+// @description  Runs Cerulean Skyport for you: launches airship shipments, swaps bait, crafts Sky Pirate Swiss and Aurora Bocconcini, picks your weapon, base and luck charms, and starts raids. Starts paused so you can check its plan first. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
 // @author       Kane
 // @license      MIT
 // @match        https://www.mousehuntgame.com/*
