@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MouseHunt Cerulean Skyport Autopilot (Kane)
 // @namespace    https://greasyfork.org/en/users/979741
-// @version      1.0.3
-// @description  Runs Cerulean Skyport for you: launches airship shipments, swaps bait, crafts Sky Pirate Swiss and Aurora Bocconcini, and starts raids with the luckiest weapon and luck charms. Starts paused so you can check its plan first. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
+// @version      1.0.4
+// @description  Runs Cerulean Skyport for you: launches airship shipments, swaps bait, crafts Sky Pirate Swiss and Aurora Bocconcini, picks your weapon and luck charms, and starts raids. Starts paused so you can check its plan first. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
 // @author       Kane
 // @license      MIT
 // @match        https://www.mousehuntgame.com/*
@@ -444,9 +444,12 @@
         canShip: sh.can_ship !== false,
         cost: c ? toNum(c.quantity) : null,
         locationName: loc.name || null,
-        intel: intelType ? qty(intelType) : null,
+        intel: intelType && items[intelType] != null ? qty(intelType) : null,
       };
     }
+    // Raid intel at the in-flight shipment's location (current_shipment's own location if it has one).
+    const csIntel = cs && cs.location && cs.location.intel_item && cs.location.intel_item.type;
+    const shipIntel = csIntel ? (items[csIntel] != null ? qty(csIntel) : null) : shipType && shipments[shipType] ? shipments[shipType].intel : null;
 
     let isIntercepting = !!q.is_intercepting;
     const cr = q.current_raid && !Array.isArray(q.current_raid) && typeof q.current_raid === 'object' ? q.current_raid : null;
@@ -475,6 +478,7 @@
       raids,
       raid: isIntercepting ? { name: (cr && cr.name) || (raidDef && raidDef.name) || 'Raid', type: raidDef ? raidDef.type : (cr && cr.type) || null, powerTypes: raidDef ? raidDef.powerTypes : [], hunts: raidHunts } : null,
       shipType,
+      shipIntel,
       shipName: cs ? (cs.name || (shipDef && shipDef.label) || shipType) : null,
       hunts,
       inFlight: isShipping && hunts > 0,
@@ -519,20 +523,23 @@
   // the game, writes storage or reads the page; tests extract the whole region (tests/decide.test.js).
 
   // Shipment bait options (cfg.spiceMode). `cheese`: the premium cheese (null = Swiss only); `spiceOnly`:
-  // only on Aurora Spice shipments; `useMin`: Min Bocconcini to keep applies. `hint` is shown in the panel.
+  // only on Aurora Spice shipments; `useMin`: Min Bocconcini to keep applies; `intelCap`: Swiss once the
+  // shipment's location holds INTEL_CAP intel (Romano stays on: it also brings more trading loot).
+  // `hint` is shown in the panel.
   const BAIT_MODES = {
     swiss: { cheese: null, hint: 'Swiss on every shipment.' },
-    romano: { cheese: 'romano', hint: 'Romano on every shipment; Swiss on all when out.' },
-    bocconcini: { cheese: 'bocconcini', useMin: true,
-      hint: 'Bocconcini on every shipment; Swiss on all when out or at the minimum.' },
-    bocconcini_spice: { cheese: 'bocconcini', spiceOnly: true, useMin: true,
-      hint: 'Bocconcini on Spice, Swiss on the rest; Swiss on all when out or at the minimum.' },
+    romano: { cheese: 'romano', hint: 'Romano on every shipment. Swiss once Romano runs out.' },
+    bocconcini: { cheese: 'bocconcini', useMin: true, intelCap: true,
+      hint: `Bocconcini on every shipment. Swiss once Bocconcini runs out, hits the minimum, or the location has ${INTEL_CAP} intel.` },
+    bocconcini_spice: { cheese: 'bocconcini', spiceOnly: true, useMin: true, intelCap: true,
+      hint: `Bocconcini on Spice, Swiss on the rest. Swiss once Bocconcini runs out, hits the minimum, or the location has ${INTEL_CAP} intel.` },
   };
   const baitMode = (c = cfg) => BAIT_MODES[c.spiceMode] || BAIT_MODES.swiss;
 
   // The shipment bait rule in one place: the premium cheese while you have it (above the minimum, where it
   // applies), otherwise Swiss on every shipment. Returns the cheese per shipment type, why the premium
-  // cheese is not used (null | 'out' | 'min') and the matching log problems.
+  // cheese is not used (null | 'out' | 'min') and the matching log problems. `capped(type, intel)`: the
+  // premium cheese would apply but the location already holds INTEL_CAP intel (intelCap modes), so Swiss.
   function shipmentBait(s, c = cfg) {
     const mode = baitMode(c);
     const cheese = mode.cheese;
@@ -544,8 +551,11 @@
     } else if (fallback === 'min') {
       problems['bocc:min'] = [`⚠ Bocconcini at minimum (${min}), using Swiss on every shipment`, '✔ Bocconcini above minimum again'];
     }
+    const applies = (type) => !!cheese && !fallback && (!mode.spiceOnly || type === 'spice_shipment');
+    const capped = (type, intel = null) => applies(type) && !!mode.intelCap && intel != null && intel >= INTEL_CAP;
     return {
-      forShipment: (type) => (cheese && !fallback && (!mode.spiceOnly || type === 'spice_shipment') ? cheese : 'swiss'),
+      forShipment: (type, intel = null) => (applies(type) && !capped(type, intel) ? cheese : 'swiss'),
+      capped,
       fallback,
       problems,
     };
@@ -701,13 +711,16 @@
         const wpn = weapon.action(s);
         return wpn ? doing(lead, wpn) : decision(lead, `${head} (bait swap off)`);
       }
-      const want = shipmentBait(s, cfg).forShipment(s.shipType);
+      const bait = shipmentBait(s, cfg);
+      const want = bait.forShipment(s.shipType, s.shipIntel);
+      const capped = bait.capped(s.shipType, s.shipIntel);
+      const full = capped ? ` · intel ${s.shipIntel}/${INTEL_CAP}, Swiss` : '';
       if (s.baitKey === want) {
         const wpn = weapon.action(s);
         if (wpn) return doing(lead, wpn);
         const luck = shipCharm.luckAction(s);
         if (luck) return doing(lead, luck);
-        return decision(lead, `${head}, ${armedText(s, BAITS[want].label)}${shipCharm.note ? ` · ${shipCharm.note}` : ''}`);
+        return decision(lead, `${head}, ${armedText(s, BAITS[want].label)}${full}${shipCharm.note ? ` · ${shipCharm.note}` : ''}`);
       }
       if (s[want] <= 0) {
         if (want === 'swiss' && cfg.autoCraft) {
@@ -718,7 +731,8 @@
         return decision(lead, `${head}, out of ${BAITS[want].label}`);
       }
       if (backedOff('bait')) return decision(lead, `${head}, bait swap backing off`, true);
-      return doing(lead, { kind: 'bait', label: `Arm ${BAITS[want].label}`, run: () => armBait(want) });
+      const why = capped ? ` (location at ${s.shipIntel} intel)` : '';
+      return doing(lead, { kind: 'bait', label: `Arm ${BAITS[want].label}${why}`, run: () => armBait(want) });
     }
 
     // Docked: a raid, else a launch, else the docked bait. `note` says why nothing launched.
@@ -754,7 +768,8 @@
         note = `Ready for ${sh.label}, open Camp to launch`;
         warn = false;
       } else {
-        const cheese = shipmentBait(s, cfg).forShipment(sh.type);
+        const live = s.shipments[sh.type];
+        const cheese = shipmentBait(s, cfg).forShipment(sh.type, live ? live.intel : null);
         if (cheese === 'swiss' && s.swiss < MIN_SWISS) {
           if (cfg.autoCraft) {
             const c = craftDecision(s, ctx);
