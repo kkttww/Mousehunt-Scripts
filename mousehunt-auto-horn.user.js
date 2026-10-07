@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MouseHunt Auto Horn & KR Solver (Kane)
 // @namespace    https://greasyfork.org/en/users/979741
-// @version      1.0.1
+// @version      1.0.2
 // @description  Sounds the hunter's horn after a random delay you choose and auto-solves King's Rewards. Never stops silently, reloads only when needed, and flags the tab if a King's Reward needs you. Pairs with MouseHunt Auto Disarm/Swap Bait (Kane) and Cerulean Skyport Autopilot (Kane).
 // @author       Kane
 // @license      MIT
@@ -1620,7 +1620,7 @@
   /* ---------------- Reload (only when the Skyport script is idle) ---------------- */
   let reloading = false;
   async function safeReload(reason) {
-    if (reloading) return;
+    if (reloading || (cfg.paused && !/King's Reward/.test(reason))) return;
     reloading = true;
     log(`Reloading: ${reason}`);
     const start = Date.now();
@@ -1822,6 +1822,15 @@
       log("King's Reward cleared");
     }
 
+    // Paused: no horns and no watchdog reloads (King's Rewards above are still solved).
+    if (cfg.paused) {
+      st.hornAt = 0;
+      st.busyWaitSince = 0;
+      st.lastProgress = now;
+      setStatus('ready', 'Paused', 'no horns');
+      return;
+    }
+
     const ready = !!$1(SEL.hornReady);
     if (st.wasReady && !ready) st.lastProgress = now;   // a horn went off
     st.wasReady = ready;
@@ -1888,6 +1897,10 @@
 #${UI_ID} .mhah-status{color:#aab2c0;}
 #${UI_ID} .mhah-status b{color:#e6e9ef;font-weight:600;}
 #${UI_ID} .mhah-status.mhah-err,#${UI_ID} .mhah-status.mhah-err b{color:#ff7b72;}
+#${UI_ID} .mhah-pause{flex:none;padding:1px 8px;height:20px;border-radius:999px;cursor:pointer;font:600 11px/16px -apple-system,Segoe UI,Roboto,Arial,sans-serif;white-space:nowrap;border:1px solid #e3b341;background:rgba(227,179,65,.18);color:#e3b341;}
+#${UI_ID} .mhah-pause:hover{background:rgba(227,179,65,.28);}
+#${UI_ID} .mhah-pause.mhah-running{border-color:rgba(86,211,100,.55);background:rgba(86,211,100,.10);color:#56d364;}
+#${UI_ID} .mhah-pause.mhah-running:hover{background:rgba(86,211,100,.18);}
 #${UI_ID} .mhah-toggle{margin-left:auto;background:none;border:0;padding:0;color:#8b93a3;cursor:pointer;font:inherit;text-decoration:none;}
 #${UI_ID} .mhah-toggle:hover{color:#e6e9ef;}
 #${UI_ID} .mhah-settings{width:100%;border-top:1px solid #303747;padding-top:5px;}
@@ -1975,7 +1988,7 @@
 
     const bar = document.createElement('div');
     bar.id = UI_ID;
-    bar.innerHTML = `<span class="mhah-title">Auto Horn</span><span class="mhah-dot"></span><span class="mhah-status"></span>
+    bar.innerHTML = `<span class="mhah-title">Auto Horn</span><button class="mhah-pause" type="button" data-tip="Paused: no horns or reloads. King's Rewards are still solved."></button><span class="mhah-dot"></span><span class="mhah-status"></span>
 <button class="mhah-toggle" type="button"></button>
 <div class="mhah-settings" hidden><div class="mhah-grid"></div><button class="mhah-reset" type="button" data-tip="Restores every setting. Click twice.">Reset to defaults</button></div>`;
     statusEl = bar.querySelector('.mhah-status');
@@ -2030,6 +2043,21 @@
       resetBtn.classList.remove('mhah-armed');
       resetBtn.textContent = 'Reset to defaults';
       log('Settings reset to defaults');
+    });
+    const pauseBtn = bar.querySelector('.mhah-pause');
+    const showPause = () => {
+      pauseBtn.textContent = cfg.paused ? '❚❚ Paused' : '▶ Running';
+      pauseBtn.classList.toggle('mhah-running', !cfg.paused);
+    };
+    showPause();
+    pauseBtn.addEventListener('click', () => {
+      cfg.paused = !cfg.paused;   // kept by "Reset to defaults", which only restores the timing settings
+      saveConfig();
+      showPause();
+      st.hornAt = 0;
+      st.lastProgress = Date.now();
+      log(cfg.paused ? 'Paused' : 'Running');
+      setStatus(cfg.paused ? 'ready' : 'idle', cfg.paused ? 'Paused' : 'Running', cfg.paused ? 'no horns' : '');
     });
     host.insertBefore(bar, host.firstChild);
     fillHostEdges(bar, host);
