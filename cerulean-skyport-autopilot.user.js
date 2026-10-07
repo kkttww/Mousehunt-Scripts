@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MouseHunt Cerulean Skyport Autopilot (Kane)
 // @namespace    https://greasyfork.org/en/users/979741
-// @version      1.0.5
+// @version      1.0.6
 // @description  Runs Cerulean Skyport for you: launches airship shipments, swaps bait, crafts Sky Pirate Swiss and Aurora Bocconcini, picks your weapon, base and luck charms, and starts raids. Starts paused so you can check its plan first. Pairs with MouseHunt Auto Horn & KR Solver (Kane).
 // @author       Kane
 // @license      MIT
@@ -287,10 +287,12 @@
     luckCharmsRaid: true,     // pick luck charms during raids
     luckCharmsNormal: 'bocconcini', // luck charms during shipments: 'off' | 'bocconcini' (only while Bocconcini is armed) | 'always'
     charmMinQty: CHARM_MIN_QTY, // only luck charms held in quantities above this are used
-    cannonRaid: 'enough',     // RaidBuster Cannonballs on raids: 'off' | 'always' | 'enough' (only with enough for the rest of the raid)
-    cannonShip: false,        // RaidBuster Cannonballs during shipments
+    cannonRaid: true,         // RaidBuster Cannonballs on every raid hunt (+1 Ingot / intel per hunt) while any are left
+    cannonShip: false,        // ... and on shipments, only above cannonKeep
+    cannonKeep: 25,           // Cannonballs kept for raids (shipments only fire above this)
     dentureBase: 'off',       // Signature Series Denture Base: 'off' | 'raid' | 'ship' (raids + shipments) | 'always'
     toothletMin: 0,           // keep at least this many Toothlets (0 = use them all)
+    basePrefer: 'charm',      // raids: 'charm' (charm first, Denture only if no charm is enough: saves Toothlets) | 'denture' (Denture first, saves charms)
     dryRun: true,            // Pause: log decisions without acting (click the Pause button to go live)
     minimized: false,
     showSettings: false,      // panel sections folded until opened
@@ -309,6 +311,7 @@
       delete saved.autoWeapon;
       const c = Object.assign({}, DEFAULTS, saved);
       if (typeof c.luckCharmsNormal === 'boolean') c.luckCharmsNormal = c.luckCharmsNormal ? 'always' : 'off';
+      if (typeof c.cannonRaid === 'string') c.cannonRaid = c.cannonRaid !== 'off';   // 1.0.5: off / enough / always
       return c;
     } catch (e) {
       return Object.assign({}, DEFAULTS);
@@ -716,16 +719,13 @@
     return { action: { kind: 'craft', label, run: () => craftCheese(c, plan, s[which]) } };
   }
 
-  // RaidBuster Cannonballs ("fuel"): the HUD toggle switches them on/off. Only managed when one of the
-  // cannonball settings is on; otherwise the player's own choice is left alone.
-  // Returns true/false, or null when that setting is off (leave the switch as the player set it).
+  // RaidBuster Cannonballs ("fuel"): +1 to Skyport loot drops per hunt; Ingots (raids) are worth the most, so
+  // raids fire while any are left and shipments only above the reserve kept for raids. The HUD toggle
+  // switches them; a stage whose setting is off leaves the switch as the player set it.
+  // Returns true/false, or null when that stage's setting is off.
   function fuelWanted(s, c = cfg) {
-    if (s.isIntercepting) {
-      if (c.cannonRaid === 'always') return s.cannonball > 0;
-      if (c.cannonRaid === 'enough') return s.cannonball >= Math.max(1, s.raid.hunts);
-      return null;
-    }
-    if (s.inFlight) return c.cannonShip ? s.cannonball > 0 : null;
+    if (s.isIntercepting) return c.cannonRaid ? s.cannonball > 0 : null;
+    if (s.inFlight) return c.cannonShip ? s.cannonball > Math.max(0, toNum(c.cannonKeep)) : null;
     return null;
   }
 
@@ -1131,6 +1131,8 @@
   });
 
   // Charm choice for the current setup; returns a short note for the panel.
+  // Returns { note, short }: `short` when even the chosen charm (or no charm above the minimum) leaves the
+  // luck below minluck.
   async function applyLuckCharm(minluck, gear, source, onArm) {
     const cur = armedGear(gear);
     const luckNoCharm = cur.luck - (cur.charm ? cur.charm.luck : 0);
@@ -1138,15 +1140,16 @@
     const src = source === 'fallback' ? ` [target ${FALLBACK_LUCK}, minluck unknown]` : source === 'tool' ? ' [Minluck tool]' : '';
     if (need <= 0) {
       if (cur.charm && cur.charm.luck > 0) await disarmCharm();
-      return `luck ${luckNoCharm}/${minluck}, no charm needed${src}`;
+      return { note: `luck ${luckNoCharm}/${minluck}, no charm needed${src}`, short: false };
     }
     const pick = chooseCharm(gear.charms, need);
-    if (!pick) return `luck ${luckNoCharm}/${minluck}, no luck charm above ${charmMin()}${src}`;
+    if (!pick) return { note: `luck ${luckNoCharm}/${minluck}, no luck charm above ${charmMin()}${src}`, short: true };
     if (!cur.charm || cur.charm.name !== pick.charm.name) {
       if (onArm) onArm(pick.charm.name);
       await armGear(pick.charm.type, 'trinket', pick.charm.name);
     }
-    return `${pick.charm.name} +${pick.charm.luck} → luck ${luckNoCharm + pick.charm.luck}/${minluck}${pick.enough ? '' : ' (not guaranteed)'}${src}`;
+    return { note: `${pick.charm.name} +${pick.charm.luck} → luck ${luckNoCharm + pick.charm.luck}/${minluck}${pick.enough ? '' : ' (not guaranteed)'}${src}`,
+      short: !pick.enough };
   }
 
   // One raid at a time: setup (the raid's luck charm, after Auto Trap has picked the weapon) → done, and the
@@ -1183,7 +1186,9 @@
       const cur = await minluck.current(pt);
       const cached = cur.source === 'fallback' ? store.minluck[`${r.name}|${pt}`] : null;
       const ml = cached != null ? { value: cached === 'inf' ? Infinity : cached, source: 'tool' } : cur;
-      a.note = await luck.apply(ml.value, await gear.list(), ml.source);
+      const res = await luck.apply(ml.value, await gear.list(), ml.source);
+      a.note = res.note;
+      a.short = res.short;   // read by Auto Base ('Charm first': the Denture only when no charm is enough)
       a.charmName = trap.trinket();
       a.signature = trap.signature();
       a.phase = 'done';
@@ -1204,6 +1209,11 @@
     return {
       get store() { return store; },
       get note() { return store.active ? store.active.note || '' : ''; },
+      // For the current raid: true when the charm can't reach minluck, false when it can, null until checked.
+      short(s) {
+        const a = s.isIntercepting && s.raid && activeFor(s.raid.name);
+        return a && a.phase === 'done' && typeof a.short === 'boolean' ? a.short : null;
+      },
       isActive: () => !!store.active,
 
       // Every tick: a finished setup re-checks the charm when anything armed changed since it was picked
@@ -1363,7 +1373,7 @@
       async apply(onArm) {
         const gear = await getGear(true);
         const ml = await minluck.current((window.user || {}).trap_power_type_name);
-        return applyLuckCharm(ml.value, gear, ml.source, onArm);
+        return (await applyLuckCharm(ml.value, gear, ml.source, onArm)).note;
       },
     },
     config: () => cfg,
@@ -1498,8 +1508,9 @@
   // remembered (`prev`) and armed again when the Denture is no longer wanted. Only a Denture this script armed
   // is ever taken off; `pending` marks an arm in progress (one that times out but lands later is still ours).
   // Seams: storage { load, save }, gear { charge() -> { owned, toothlets }, bases() -> [{ type, name, luck }] },
-  // trap { base(), signature(), arm(type, name) }, plus config(), backedOff(kind), log(msg).
-  function makeBase({ storage, gear, trap, config, backedOff, log }) {
+  // trap { base(), signature(), arm(type, name) }, raid { short(s) } (the raid charm can't reach minluck: true /
+  // false / null until checked), plus config(), backedOff(kind), log(msg).
+  function makeBase({ storage, gear, trap, raid, config, backedOff, log }) {
     // `yielded`: the stage in which you swapped the Denture off yourself; Auto Base waits for the next stage.
     const own = Object.assign({ prev: null, ours: false, pending: false, yielded: null }, storage.load());
     const save = () => storage.save({ prev: own.prev, ours: own.ours, pending: own.pending, yielded: own.yielded });
@@ -1514,7 +1525,8 @@
     const covers = (s) => (mode() === 'always') || (mode() === 'ship' && (s.isIntercepting || s.inFlight))
       || (mode() === 'raid' && s.isIntercepting);
     const stage = (s) => (s.isIntercepting ? 'raid' : s.inFlight ? 'ship' : 'docked');
-    const key = (s) => `${mode()}|${stage(s)}|${min()}|${trap.signature()}|${hunt}`;
+    const charmFirst = () => config().basePrefer === 'charm' && config().luckCharmsRaid;
+    const key = (s) => `${mode()}|${stage(s)}|${min()}|${charmFirst()}|${raid.short(s)}|${trap.signature()}|${hunt}`;
 
     function release() {
       own.prev = null;
@@ -1530,6 +1542,8 @@
       if (!owned) return 'not owned';
       if (toothlets <= 0) return 'out of Toothlets';
       if (toothlets <= min()) return `Toothlets at minimum (${min()})`;
+      // Charm first: on a raid the Denture only goes on once the best charm can't reach minluck, then stays.
+      if (s.isIntercepting && charmFirst() && !own.ours && raid.short(s) !== true) return 'a charm is enough';
       return '';
     }
 
@@ -1561,6 +1575,8 @@
         own.pending = false;
         save();
         log(`✔ Base: ${DENTURE.short} (${toothlets.toLocaleString()} Toothlets)`);
+      } else if (reason === 'a charm is enough') {
+        // nothing to do: the base you have stays on
       } else if (reason && own.ours) {
         const bases = (await gear.bases()).filter((b) => b.type !== DENTURE.type);
         let back = own.prev && bases.find((b) => b.type === own.prev.type || b.name === own.prev.name);
@@ -1599,8 +1615,11 @@
         if (!own.ours && armed === DENTURE.name) return `${n} · You armed the Denture yourself: left on.`;
         // Plain words for a new player: when the Denture goes on, and which base comes back after.
         const other = own.ours ? (own.prev ? own.prev.name : 'your luckiest base') : armed || 'your base';
-        const when = { raid: 'Swaps in for raids', ship: 'Swaps in for raids and shipments',
-          always: 'Stays on until the Toothlets run out' }[mode()];
+        const when = (charmFirst()
+          ? { raid: 'Swaps in for raids when no charm is enough', ship: 'Swaps in for shipments, and for raids when no charm is enough',
+            always: 'Stays on until the Toothlets run out (raids: only when no charm is enough)' }
+          : { raid: 'Swaps in for raids', ship: 'Swaps in for raids and shipments',
+            always: 'Stays on until the Toothlets run out' })[mode()];
         return `${n} · ${when}, then back to ${other}.`;
       },
 
@@ -1638,6 +1657,7 @@
       signature: () => trapSignature(),
       arm: (type, name) => armGear(type, 'base', name),
     },
+    raid: { short: (s) => raids.short(s) },
     config: () => cfg,
     backedOff: (kind) => backedOff(kind),
     log: (msg) => log(msg),
@@ -1984,6 +2004,7 @@
 #${PANEL_ID} .mhcs-bocc,#${PANEL_ID} .mhcs-base{display:none !important;}
 #${PANEL_ID}.mhcs-show-bocc .mhcs-bocc,#${PANEL_ID}.mhcs-show-base .mhcs-mini.mhcs-base{display:flex !important;}
 #${PANEL_ID}.mhcs-show-base .mhcs-hint.mhcs-base{display:block !important;}
+#${PANEL_ID}.mhcs-show-base .mhcs-line.mhcs-base{display:flex !important;}
 #${PANEL_ID} .mhcs-hint{color:#8b93a3;font-size:11px;line-height:1.35;margin:2px 0 4px;}
 #${PANEL_ID} .mhcs-subhead{color:#9ecbff;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;margin:10px 0 4px;padding-bottom:2px;border-bottom:1px solid #303747;}
 #${PANEL_ID} .mhcs-subhead:first-of-type{margin-top:4px;}
@@ -2054,6 +2075,11 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
         <option value="ship">Raids and shipments</option>
         <option value="always">Every hunt</option>
       </select><span class="mhcs-mini mhcs-base" data-tip="Toothlets to keep. At or below it, your old base goes back on. 0 = none.">Min <input type="number" min="0" step="1" data-c="toothletMin"></span></div>
+    <div class="mhcs-line mhcs-base" data-tip="Charm first: on raids the Denture only goes on if no charm reaches minluck. Saves Toothlets."><span class="mhcs-lbl">Prefer</span>
+      <select data-c="basePrefer">
+        <option value="charm">Charm first</option>
+        <option value="denture">Denture first</option>
+      </select></div>
     <div class="mhcs-hint mhcs-base" data-f="baseHint"></div>
     <div class="mhcs-subhead">Luck Charms</div>
     <label class="mhcs-line" data-tip="Closes the gap to minluck. Removed after the raid."><span class="mhcs-lbl">Raids</span><input type="checkbox" data-c="luckCharmsRaid"></label>
@@ -2065,13 +2091,8 @@ ${TOGGLES.map(([key, text, tip]) => `    <label data-tip="${tip}"><input type="c
       </select></div>
     <div class="mhcs-line" data-tip="Only charms you hold more of. 0 = any."><span class="mhcs-lbl">Min held</span><input type="number" min="0" step="1" data-c="charmMinQty"></div>
     <div class="mhcs-subhead">Cannonballs</div>
-    <div class="mhcs-line" data-tip="Enough: only when you hold one per raid hunt left. Always: while any are left. Off: switch left alone."><span class="mhcs-lbl">Raids</span>
-      <select data-c="cannonRaid">
-        <option value="off">Off</option>
-        <option value="enough">Enough</option>
-        <option value="always">Always</option>
-      </select></div>
-    <label class="mhcs-line" data-tip="While you have any."><span class="mhcs-lbl">Shipments</span><input type="checkbox" data-c="cannonShip"></label>
+    <label class="mhcs-line" data-tip="+1 Ingot or intel per raid hunt, while any are left."><span class="mhcs-lbl">Raids</span><input type="checkbox" data-c="cannonRaid"></label>
+    <div class="mhcs-line"><label class="mhcs-line mhcs-grow" data-tip="+1 shipment loot per hunt, only above the number kept for raids."><span class="mhcs-lbl">Shipments</span><input type="checkbox" data-c="cannonShip"></label><span class="mhcs-mini" data-tip="Cannonballs kept for raids. 25 covers one raid.">Keep <input type="number" min="0" step="1" data-c="cannonKeep"></span></div>
     <div class="mhcs-subhead">Crafting</div>
     <label data-tip="2 cheese per craft; Gold when out. Off: Gold only."><input type="checkbox" data-c="craftEssence"> Use Magic Essence (Recommended)</label>
     <div class="mhcs-subhead">Reserves</div>
